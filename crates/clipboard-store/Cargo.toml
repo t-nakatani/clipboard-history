@@ -10,3 +10,6 @@ publish.workspace = true
 blake3.workspace = true
 clipboard-core = { path = "../clipboard-core" }
 rusqlite.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
