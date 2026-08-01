@@ -67,31 +67,31 @@ struct HistoryPanelConfiguration {
 
     static let standard = HistoryPanelConfiguration(
         window: Window(
-            width: 630,
+            width: 700,
             initialHeight: 440,
             minimumHeight: 440,
             screenHeightFraction: 0.92,
             anchorGap: 6
         ),
         content: Content(
-            topInset: 8,
-            leadingInset: 10,
+            topInset: 6,
+            leadingInset: 2,
             bottomInset: 8,
-            trailingInset: 10,
-            sectionSpacing: 7,
+            trailingInset: 3,
+            sectionSpacing: 3,
             searchItemSpacing: 10,
             minimumHistoryHeight: 380
         ),
         rows: Rows(
-            textHeight: 18,
-            imageHeight: 82,
+            textHeight: 22,
+            imageHeight: 60,
             intercellSpacing: 0,
-            leadingInset: 5,
+            leadingInset: 1,
             trailingInset: 8,
             imageVerticalInset: 4,
-            imageWidth: 108,
+            imageWidth: 80,
             imageToTextSpacing: 10,
-            textLeadingSpacing: 3,
+            textLeadingSpacing: 1,
             textToMetadataSpacing: 10,
             metadataMaximumWidth: 116
         ),
