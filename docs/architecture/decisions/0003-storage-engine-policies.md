@@ -43,6 +43,22 @@ Accepted for experimentation
 
 保持制限は件数と論理payload容量の両方に適用し、pinned rowを保護する。pruningは100 rowずつのtransactionへ分割し、interactive writeのtail latencyを抑える。削除pageはfreelistへ戻るだけなので、新規DBでは`auto_vacuum=INCREMENTAL`を有効化し、低優先度で`incremental_vacuum`を実行する。大量prune後はFTS5の`optimize`が必要だが約0.5秒かかるため、idle maintenanceとして稀に実行する。full `VACUUM`は採用しない。
 
+## Secure deletion
+
+履歴にはpasswordやtokenが含まれうるため、削除は論理削除で終わらせない。全connectionで`PRAGMA secure_delete=ON`を設定し、`clips`、`representations`、`clip_previews`、FTS5索引の解放cellをSQLiteに零クリアさせる。secure_deleteはconnection単位の設定なので、`configure_connection`で書き込み前に必ず適用する。
+
+secure_delete導入前に作られたDBはfree pageに平文を残している。schema version 3への一度きりのmigrationでfull `VACUUM`とWAL truncateを実行してファイルを再構築する。定常運用でfull VACUUMを採用しない方針は変えず、この経路だけを例外とする。`user_version`のbumpが再実行を防ぐ。
+
+外部payloadは`unlink`前にファイル本体を零で上書きする。GC対象のstaged一時ファイルも同じ経路を通す。
+
+残存リスクは以下のとおりで、storeでは解消できない。
+
+- APFSはcopy-on-writeであり、上書きが元blockではなく新blockへ着地しうる。旧blockは再利用されるまで読める可能性がある。
+- 既存のAPFS snapshot、Time Machine、iCloudなどのbackupは削除前のコピーを保持し続ける。
+- SSDのwear levelingとTRIM挙動により、物理媒体上の残留は制御できない。
+
+これらを前提に、より強い保証が必要な場合はfilesystem levelの暗号化（FileVault）に依存する。
+
 ## Migration and recovery
 
 - schema versionは`PRAGMA user_version`で管理する。

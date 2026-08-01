@@ -678,6 +678,89 @@ mod tests {
     }
 
     #[test]
+    fn deleted_clip_content_is_not_recoverable_from_the_database_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-secure-delete-test-{unique}"));
+        let database_path = root.join("history.sqlite");
+        let options = StoreOptions::new(&database_path, root.join("payloads"));
+        let service = HistoryService::new(
+            StoreHandle::open(options).unwrap(),
+            SearchTextPolicy::default(),
+        );
+        let secret = format!("secret-passphrase-{unique}-do-not-linger");
+        let preview_marker: Vec<u8> = format!("preview-marker-{unique}").into_bytes();
+        let external_marker: Vec<u8> = format!("external-marker-{unique}")
+            .into_bytes()
+            .repeat(2048);
+
+        let outcome = service
+            .capture(
+                ClipboardSnapshot {
+                    representations: vec![
+                        Representation {
+                            uti: "public.utf8-plain-text".into(),
+                            bytes: secret.as_bytes().to_vec(),
+                        },
+                        Representation {
+                            uti: "public.data".into(),
+                            bytes: external_marker.clone(),
+                        },
+                    ],
+                    image_preview: Some(ImagePreview {
+                        uti: "public.png".into(),
+                        bytes: preview_marker.clone(),
+                    }),
+                },
+                ClipKind::Mixed,
+                1,
+            )
+            .unwrap();
+        let clipboard_core::CaptureOutcome::Stored(stored) = outcome else {
+            panic!("expected stored clip")
+        };
+        service.repository().checkpoint_truncate().unwrap();
+        assert!(
+            file_contains(&database_path, secret.as_bytes()),
+            "the test is only meaningful if the clip really reached the file"
+        );
+
+        assert!(service.repository().delete(stored.id).unwrap());
+        service.repository().collect_garbage(100).unwrap();
+        service.repository().checkpoint_truncate().unwrap();
+        service.repository().incremental_vacuum(4096).unwrap();
+        service.repository().checkpoint_truncate().unwrap();
+
+        // secure_delete zeroes the freed cells, so neither the row text, the FTS
+        // trigram index nor the preview blob may remain in the live file or WAL.
+        for path in [
+            database_path.clone(),
+            PathBuf::from(format!("{}-wal", database_path.display())),
+        ] {
+            for needle in [secret.as_bytes(), preview_marker.as_slice()] {
+                assert!(
+                    !file_contains(&path, needle),
+                    "{} still contains deleted clip content",
+                    path.display()
+                );
+            }
+        }
+        assert!(!file_contains(&database_path, &external_marker[..64]));
+
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn file_contains(path: &Path, needle: &[u8]) -> bool {
+        let Ok(bytes) = std::fs::read(path) else {
+            return false;
+        };
+        bytes.windows(needle.len()).any(|window| window == needle)
+    }
+
+    #[test]
     fn gc_keeps_shared_payload_until_last_reference_is_deleted() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
