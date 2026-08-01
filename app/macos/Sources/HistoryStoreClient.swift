@@ -2,7 +2,7 @@ import Foundation
 
 struct PersistedCapture {
     let result: CaptureResultDto
-    let recent: [ClipSummaryDto]
+    let recentPage: HistoryPageDto
 }
 
 final class HistoryStoreClient {
@@ -42,8 +42,8 @@ final class HistoryStoreClient {
                     imagePreview: imagePreview,
                     copiedAtMs: copiedAtMs
                 )
-                let recent = try engine.recent(limit: 50)
-                return PersistedCapture(result: stored, recent: recent)
+                let recentPage = try engine.recentPage(cursor: nil, limit: 50)
+                return PersistedCapture(result: stored, recentPage: recentPage)
             }
             DispatchQueue.main.async { completion(result) }
         }
@@ -56,9 +56,13 @@ final class HistoryStoreClient {
         }
     }
 
-    func recent(limit: UInt32 = 50, completion: @escaping Completion<[ClipSummaryDto]>) {
+    func recentPage(
+        cursor: HistoryCursorDto? = nil,
+        limit: UInt32 = 50,
+        completion: @escaping Completion<HistoryPageDto>
+    ) {
         queue.async { [engine] in
-            let result = Result { try engine.recent(limit: limit) }
+            let result = Result { try engine.recentPage(cursor: cursor, limit: limit) }
             DispatchQueue.main.async { completion(result) }
         }
     }
@@ -77,14 +81,17 @@ final class HistoryStoreClient {
         }
     }
 
-    func search(
+    func searchPage(
         query: String,
         mode: SearchModeDto,
+        cursor: HistoryCursorDto? = nil,
         limit: UInt32 = 50,
-        completion: @escaping Completion<[ClipSummaryDto]>
+        completion: @escaping Completion<HistoryPageDto>
     ) {
         queue.async { [engine] in
-            let result = Result { try engine.search(query: query, mode: mode, limit: limit) }
+            let result = Result {
+                try engine.searchPage(query: query, mode: mode, cursor: cursor, limit: limit)
+            }
             DispatchQueue.main.async { completion(result) }
         }
     }

@@ -86,6 +86,20 @@ pub struct ClipSummary {
     pub has_image_preview: bool,
 }
 
+/// Stable seek position for history ordered by `(last_used_at, id) DESC`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistoryCursor {
+    pub last_used_at_ms: i64,
+    pub id: ClipId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryPage {
+    pub items: Vec<ClipSummary>,
+    pub next_cursor: Option<HistoryCursor>,
+    pub has_more: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UpsertOutcome {
     pub id: ClipId,

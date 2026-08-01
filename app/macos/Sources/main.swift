@@ -22,6 +22,43 @@ func runBindingSelfTest() -> Int32 {
         return 1
     }
 
+    var pageWindow = HistoryPageWindow(maximumCount: 200)
+    for pageIndex in 0 ..< 5 {
+        let start = pageIndex * 50
+        let items = (start ..< start + 50).map { value in
+            ClipSummaryDto(
+                id: Int64(value),
+                kind: "text",
+                lastUsedAtMs: Int64(1_000 - value),
+                pinned: false,
+                copyCount: 1,
+                payloadSize: 1,
+                preview: "item-\(value)",
+                hasImagePreview: false
+            )
+        }
+        pageWindow.apply(
+            HistoryPageDto(
+                items: items,
+                nextCursor: HistoryCursorDto(
+                    lastUsedAtMs: Int64(1_000 - (start + 49)),
+                    id: Int64(start + 49)
+                ),
+                hasMore: pageIndex < 4
+            ),
+            reset: pageIndex == 0
+        )
+    }
+    guard
+        pageWindow.rows.count == 200,
+        pageWindow.rows.first?.id == 50,
+        pageWindow.rows.last?.id == 249,
+        !pageWindow.hasMore
+    else {
+        fputs("bounded history page window did not evict the oldest loaded page\n", stderr)
+        return 1
+    }
+
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("clipboard-swift-self-test-\(UUID().uuidString)", isDirectory: true)
     do {

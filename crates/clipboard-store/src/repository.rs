@@ -1,6 +1,6 @@
 use clipboard_core::{
-    ClipCandidate, ClipId, ClipKind, ClipSummary, ImagePreview, MatchMode, PlannedQuery,
-    Representation, UpsertOutcome,
+    ClipCandidate, ClipId, ClipKind, ClipSummary, HistoryCursor, HistoryPage, ImagePreview,
+    MatchMode, PlannedQuery, Representation, UpsertOutcome,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -182,38 +182,39 @@ fn insert_representation(
     Ok(())
 }
 
-pub(crate) fn recent(
+pub(crate) fn recent_page(
     connection: &Connection,
+    cursor: Option<HistoryCursor>,
     limit: usize,
-) -> Result<Vec<ClipSummary>, StoreError> {
-    let mut statement = connection.prepare(
-        "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
-                c.payload_size, substr(c.normalized_text, 1, 256),
-                EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
-         FROM clips AS c
-         ORDER BY last_used_at DESC, id DESC
-         LIMIT ?1",
-    )?;
-    let rows = statement.query_map([limit.min(1000) as i64], |row| {
-        let raw_kind: i64 = row.get(1)?;
-        let kind = match raw_kind {
-            0 => ClipKind::Text,
-            1 => ClipKind::Image,
-            2 => ClipKind::File,
-            _ => ClipKind::Mixed,
-        };
-        Ok(ClipSummary {
-            id: ClipId(row.get(0)?),
-            kind,
-            last_used_at_ms: row.get(2)?,
-            pinned: row.get(3)?,
-            copy_count: row.get::<_, i64>(4)? as u64,
-            payload_size: row.get::<_, i64>(5)? as u64,
-            preview: row.get(6)?,
-            has_image_preview: row.get(7)?,
-        })
-    })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+) -> Result<HistoryPage, StoreError> {
+    let limit = limit.clamp(1, 200);
+    let fetch_limit = (limit + 1) as i64;
+    let items = if let Some(cursor) = cursor {
+        query_summaries(
+            connection,
+            "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
+                    c.payload_size, substr(c.normalized_text, 1, 256),
+                    EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
+             FROM clips AS c
+             WHERE c.last_used_at < ?1
+                OR (c.last_used_at = ?1 AND c.id < ?2)
+             ORDER BY c.last_used_at DESC, c.id DESC
+             LIMIT ?3",
+            params![cursor.last_used_at_ms, cursor.id.0, fetch_limit],
+        )?
+    } else {
+        query_summaries(
+            connection,
+            "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
+                    c.payload_size, substr(c.normalized_text, 1, 256),
+                    EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
+             FROM clips AS c
+             ORDER BY c.last_used_at DESC, c.id DESC
+             LIMIT ?1",
+            [fetch_limit],
+        )?
+    };
+    Ok(history_page(items, limit))
 }
 
 pub(crate) fn image_preview(
@@ -293,85 +294,193 @@ pub(crate) fn representations(
     Ok(result)
 }
 
-pub(crate) fn search(
+pub(crate) fn search_page(
     connection: &Connection,
     query: PlannedQuery,
+    cursor: Option<HistoryCursor>,
     limit: usize,
-) -> Result<Vec<ClipSummary>, StoreError> {
-    let limit = limit.clamp(1, 200) as i64;
+) -> Result<HistoryPage, StoreError> {
+    let limit = limit.clamp(1, 200);
+    let fetch_limit = (limit + 1) as i64;
     match query {
-        PlannedQuery::Empty => recent(connection, limit as usize),
-        PlannedQuery::RecentScan { mode, needle } => query_summaries(
-            connection,
-            "SELECT id, content_kind, last_used_at, pinned, copy_count,
-                    payload_size, substr(normalized_text, 1, 256), has_image_preview
-             FROM (
-                 SELECT id, content_kind, last_used_at, pinned, copy_count,
-                        payload_size, normalized_text,
-                        EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = clips.id)
-                            AS has_image_preview
-                 FROM clips
-                 WHERE normalized_text IS NOT NULL
-                 ORDER BY last_used_at DESC, id DESC
-                 LIMIT 2000
-             )
-             WHERE normalized_text LIKE ?1 ESCAPE '\\'
-             ORDER BY last_used_at DESC, id DESC
-             LIMIT ?2",
-            params![like_pattern(mode, &needle), limit],
-        ),
+        PlannedQuery::Empty => recent_page(connection, cursor, limit),
+        PlannedQuery::RecentScan { mode, needle } => {
+            let pattern = like_pattern(mode, &needle);
+            let items = if let Some(cursor) = cursor {
+                query_summaries(
+                    connection,
+                    "SELECT id, content_kind, last_used_at, pinned, copy_count,
+                            payload_size, substr(normalized_text, 1, 256), has_image_preview
+                     FROM (
+                         SELECT id, content_kind, last_used_at, pinned, copy_count,
+                                payload_size, normalized_text,
+                                EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = clips.id)
+                                    AS has_image_preview
+                         FROM clips
+                         WHERE normalized_text IS NOT NULL
+                         ORDER BY last_used_at DESC, id DESC
+                         LIMIT 2000
+                     )
+                     WHERE normalized_text LIKE ?1 ESCAPE '\\'
+                       AND (last_used_at < ?2 OR (last_used_at = ?2 AND id < ?3))
+                     ORDER BY last_used_at DESC, id DESC
+                     LIMIT ?4",
+                    params![pattern, cursor.last_used_at_ms, cursor.id.0, fetch_limit],
+                )?
+            } else {
+                query_summaries(
+                    connection,
+                    "SELECT id, content_kind, last_used_at, pinned, copy_count,
+                            payload_size, substr(normalized_text, 1, 256), has_image_preview
+                     FROM (
+                         SELECT id, content_kind, last_used_at, pinned, copy_count,
+                                payload_size, normalized_text,
+                                EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = clips.id)
+                                    AS has_image_preview
+                         FROM clips
+                         WHERE normalized_text IS NOT NULL
+                         ORDER BY last_used_at DESC, id DESC
+                         LIMIT 2000
+                     )
+                     WHERE normalized_text LIKE ?1 ESCAPE '\\'
+                     ORDER BY last_used_at DESC, id DESC
+                     LIMIT ?2",
+                    params![pattern, fetch_limit],
+                )?
+            };
+            Ok(history_page(items, limit))
+        }
         PlannedQuery::Indexed {
             mode: MatchMode::Prefix,
             needle,
-        } => search_prefix(connection, &needle, limit),
-        PlannedQuery::Indexed { mode, needle } => query_summaries(
-            connection,
-            "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
-                    c.payload_size, substr(c.normalized_text, 1, 256),
-                    EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
-             FROM clips_fts
-             JOIN clips AS c ON c.id = clips_fts.rowid
-             WHERE clips_fts.normalized_text LIKE ?1 ESCAPE '\\'
-             ORDER BY c.last_used_at DESC, c.id DESC
-             LIMIT ?2",
-            params![like_pattern(mode, &needle), limit],
-        ),
+        } => search_prefix_page(connection, &needle, cursor, limit),
+        PlannedQuery::Indexed { mode, needle } => {
+            let pattern = like_pattern(mode, &needle);
+            let items = if let Some(cursor) = cursor {
+                query_summaries(
+                    connection,
+                    "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
+                            c.payload_size, substr(c.normalized_text, 1, 256),
+                            EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
+                     FROM clips_fts
+                     JOIN clips AS c ON c.id = clips_fts.rowid
+                     WHERE clips_fts.normalized_text LIKE ?1 ESCAPE '\\'
+                       AND (c.last_used_at < ?2 OR (c.last_used_at = ?2 AND c.id < ?3))
+                     ORDER BY c.last_used_at DESC, c.id DESC
+                     LIMIT ?4",
+                    params![pattern, cursor.last_used_at_ms, cursor.id.0, fetch_limit],
+                )?
+            } else {
+                query_summaries(
+                    connection,
+                    "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
+                            c.payload_size, substr(c.normalized_text, 1, 256),
+                            EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
+                     FROM clips_fts
+                     JOIN clips AS c ON c.id = clips_fts.rowid
+                     WHERE clips_fts.normalized_text LIKE ?1 ESCAPE '\\'
+                     ORDER BY c.last_used_at DESC, c.id DESC
+                     LIMIT ?2",
+                    params![pattern, fetch_limit],
+                )?
+            };
+            Ok(history_page(items, limit))
+        }
     }
 }
 
-fn search_prefix(
+fn search_prefix_page(
     connection: &Connection,
     needle: &str,
-    limit: i64,
-) -> Result<Vec<ClipSummary>, StoreError> {
+    cursor: Option<HistoryCursor>,
+    limit: usize,
+) -> Result<HistoryPage, StoreError> {
     let pattern = like_pattern(MatchMode::Prefix, needle);
-    if needle.chars().count() <= 64 {
-        query_summaries(
-            connection,
-            "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
-                    c.payload_size, substr(c.normalized_text, 1, 256),
-                    EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
-             FROM clips AS c
-             WHERE substr(normalized_text, 1, 64) LIKE ?1 ESCAPE '\\'
-               AND normalized_text LIKE ?1 ESCAPE '\\'
-             ORDER BY last_used_at DESC, id DESC
-             LIMIT ?2",
-            params![pattern, limit],
-        )
+    let fetch_limit = (limit + 1) as i64;
+    let items = if needle.chars().count() <= 64 {
+        if let Some(cursor) = cursor {
+            query_summaries(
+                connection,
+                "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
+                        c.payload_size, substr(c.normalized_text, 1, 256),
+                        EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
+                 FROM clips AS c
+                 WHERE substr(normalized_text, 1, 64) LIKE ?1 ESCAPE '\\'
+                   AND normalized_text LIKE ?1 ESCAPE '\\'
+                   AND (c.last_used_at < ?2 OR (c.last_used_at = ?2 AND c.id < ?3))
+                 ORDER BY c.last_used_at DESC, c.id DESC
+                 LIMIT ?4",
+                params![pattern, cursor.last_used_at_ms, cursor.id.0, fetch_limit],
+            )?
+        } else {
+            query_summaries(
+                connection,
+                "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
+                        c.payload_size, substr(c.normalized_text, 1, 256),
+                        EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
+                 FROM clips AS c
+                 WHERE substr(normalized_text, 1, 64) LIKE ?1 ESCAPE '\\'
+                   AND normalized_text LIKE ?1 ESCAPE '\\'
+                 ORDER BY c.last_used_at DESC, c.id DESC
+                 LIMIT ?2",
+                params![pattern, fetch_limit],
+            )?
+        }
     } else {
         let key: String = needle.chars().take(64).collect();
-        query_summaries(
-            connection,
-            "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
-                    c.payload_size, substr(c.normalized_text, 1, 256),
-                    EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
-             FROM clips AS c
-             WHERE substr(normalized_text, 1, 64) = ?1
-               AND normalized_text LIKE ?2 ESCAPE '\\'
-             ORDER BY last_used_at DESC, id DESC
-             LIMIT ?3",
-            params![key, pattern, limit],
-        )
+        if let Some(cursor) = cursor {
+            query_summaries(
+                connection,
+                "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
+                        c.payload_size, substr(c.normalized_text, 1, 256),
+                        EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
+                 FROM clips AS c
+                 WHERE substr(normalized_text, 1, 64) = ?1
+                   AND normalized_text LIKE ?2 ESCAPE '\\'
+                   AND (c.last_used_at < ?3 OR (c.last_used_at = ?3 AND c.id < ?4))
+                 ORDER BY c.last_used_at DESC, c.id DESC
+                 LIMIT ?5",
+                params![
+                    key,
+                    pattern,
+                    cursor.last_used_at_ms,
+                    cursor.id.0,
+                    fetch_limit
+                ],
+            )?
+        } else {
+            query_summaries(
+                connection,
+                "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
+                        c.payload_size, substr(c.normalized_text, 1, 256),
+                        EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
+                 FROM clips AS c
+                 WHERE substr(normalized_text, 1, 64) = ?1
+                   AND normalized_text LIKE ?2 ESCAPE '\\'
+                 ORDER BY c.last_used_at DESC, c.id DESC
+                 LIMIT ?3",
+                params![key, pattern, fetch_limit],
+            )?
+        }
+    };
+    Ok(history_page(items, limit))
+}
+
+fn history_page(mut items: Vec<ClipSummary>, limit: usize) -> HistoryPage {
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    let next_cursor = if has_more {
+        items.last().map(|last| HistoryCursor {
+            last_used_at_ms: last.last_used_at_ms,
+            id: last.id,
+        })
+    } else {
+        None
+    };
+    HistoryPage {
+        next_cursor,
+        items,
+        has_more,
     }
 }
 
@@ -455,6 +564,20 @@ mod tests {
         assert!(
             substring_plan.contains("VIRTUAL TABLE INDEX"),
             "FTS5 virtual index missing: {substring_plan}"
+        );
+
+        let recent_page_plan = explain(
+            &connection,
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM clips
+             WHERE last_used_at < ?1 OR (last_used_at = ?1 AND id < ?2)
+             ORDER BY last_used_at DESC, id DESC
+             LIMIT ?3",
+            params![1_000_i64, 500_i64, 51_i64],
+        );
+        assert!(
+            recent_page_plan.contains("idx_clips_recent"),
+            "recent keyset index missing: {recent_page_plan}"
         );
     }
 

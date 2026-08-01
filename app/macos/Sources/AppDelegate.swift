@@ -7,7 +7,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var monitor: PasteboardMonitor?
     private var storeClient: HistoryStoreClient?
     private var panel: HistoryPanel?
-    private var historyRows: [ClipSummaryDto] = []
+    private var pageWindow = HistoryPageWindow(maximumCount: 200)
+    private var historyRows: [ClipSummaryDto] { pageWindow.rows }
     private let imagePreviewCache: NSCache<NSNumber, NSImage> = {
         let cache = NSCache<NSNumber, NSImage>()
         cache.countLimit = 64
@@ -16,6 +17,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }()
     private var pendingImagePreviews: Set<Int64> = []
     private let tableView = HistoryTableView()
+    private weak var historyClipView: NSClipView?
+    private let pageSize: UInt32 = 50
+    private var isLoadingPage = false
+    private var activeSearchQuery: String?
+    private var activeSearchMode: SearchModeDto = .substring
     private let searchField = NSSearchField()
     private let searchModeControl = NSSegmentedControl(
         labels: ["完全", "前方", "部分"],
@@ -27,6 +33,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var searchGeneration = 0
     private let statusLabel = NSTextField(labelWithString: "コピー待機中")
     private let detailLabel = NSTextField(wrappingLabelWithString: "型一覧の検査後、許可されたpayloadだけを読み取ります。")
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureStatusItem()
@@ -114,15 +124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         )
         monitor?.start()
         statusLabel.stringValue = "コピー待機中"
-        storeClient.recent { [weak self] result in
-            if case let .success(rows) = result {
-                self?.updateHistory(rows)
-                if let newest = rows.first {
-                    self?.statusLabel.stringValue = "履歴 \(rows.count)件を読み込み済み"
-                    self?.detailLabel.stringValue = newest.preview ?? newest.kind
-                }
-            }
-        }
+        reloadHistory()
     }
 
     private func configureStatusItem() {
@@ -213,6 +215,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
         scrollView.scrollerStyle = .overlay
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(historyBoundsDidChange),
+            name: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView
+        )
+        historyClipView = scrollView.contentView
 
         let stack = NSStackView(views: [searchBar, scrollView])
         stack.orientation = .vertical
@@ -258,10 +268,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             switch result {
             case let .success(capture):
                 self?.statusLabel.stringValue = capture.result.inserted ? "履歴へ保存" : "既存履歴を先頭へ移動"
-                let count = capture.recent.count
+                let count = capture.recentPage.items.count
                 self?.detailLabel.stringValue = "clip #\(capture.result.id) · 最近\(count)件をメモリ保持"
                 if self?.searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
-                    self?.updateHistory(capture.recent)
+                    self?.searchGeneration += 1
+                    self?.activeSearchQuery = nil
+                    self?.isLoadingPage = false
+                    self?.apply(page: capture.recentPage, reset: true)
                 } else {
                     self?.performSearch()
                 }
@@ -293,12 +306,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             performSearch()
             return
         }
-        storeClient?.recent { [weak self] result in
+        guard let storeClient else { return }
+        searchGeneration += 1
+        let generation = searchGeneration
+        activeSearchQuery = nil
+        isLoadingPage = true
+        storeClient.recentPage(limit: pageSize) { [weak self] result in
+            guard let self, generation == self.searchGeneration else { return }
+            self.isLoadingPage = false
             switch result {
-            case let .success(rows):
-                self?.updateHistory(rows)
+            case let .success(page):
+                self.apply(page: page, reset: true)
+                self.statusLabel.stringValue = "履歴 \(page.items.count)件を読み込み済み"
+                if let newest = page.items.first {
+                    self.detailLabel.stringValue = newest.preview ?? newest.kind
+                }
             case let .failure(error):
-                self?.show(error: error)
+                self.show(error: error)
             }
         }
     }
@@ -332,13 +356,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         case 1: mode = .prefix
         default: mode = .substring
         }
+        activeSearchQuery = query
+        activeSearchMode = mode
+        isLoadingPage = true
         statusLabel.stringValue = "検索中…"
-        storeClient.search(query: query, mode: mode) { [weak self] result in
+        storeClient.searchPage(query: query, mode: mode, limit: pageSize) { [weak self] result in
             guard let self, generation == self.searchGeneration else { return }
+            self.isLoadingPage = false
             switch result {
-            case let .success(rows):
-                self.updateHistory(rows)
-                self.statusLabel.stringValue = "検索結果 \(rows.count)件"
+            case let .success(page):
+                self.apply(page: page, reset: true)
+                self.statusLabel.stringValue = "検索結果 \(page.items.count)件"
                 self.detailLabel.stringValue = "完全一致・前方一致・正確な部分一致のみ"
             case let .failure(error):
                 self.show(error: error)
@@ -346,12 +374,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
 
-    private func updateHistory(_ rows: [ClipSummaryDto]) {
-        historyRows = rows
+    private func apply(page: HistoryPageDto, reset: Bool) {
+        let anchor = reset ? nil : visibleAnchor()
+        let selectedId = historyRows.indices.contains(tableView.selectedRow)
+            ? historyRows[tableView.selectedRow].id
+            : nil
+        pageWindow.apply(page, reset: reset)
         tableView.reloadData()
-        if !rows.isEmpty, tableView.selectedRow < 0 {
+        if let selectedId, let selectedRow = historyRows.firstIndex(where: { $0.id == selectedId }) {
+            tableView.selectRowIndexes(IndexSet(integer: selectedRow), byExtendingSelection: false)
+        } else if reset {
+            tableView.deselectAll(nil)
+        }
+        if let anchor {
+            restoreVisibleAnchor(anchor)
+        } else if !historyRows.isEmpty, tableView.selectedRow < 0 {
             tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         }
+    }
+
+    @objc private func historyBoundsDidChange() {
+        let visibleRows = tableView.rows(in: tableView.visibleRect)
+        guard visibleRows.location != NSNotFound else { return }
+        if NSMaxRange(visibleRows) >= max(0, historyRows.count - 10) {
+            loadNextPage()
+        }
+    }
+
+    private func loadNextPage() {
+        guard
+            pageWindow.hasMore,
+            !isLoadingPage,
+            let cursor = pageWindow.nextCursor,
+            let storeClient
+        else { return }
+        isLoadingPage = true
+        let generation = searchGeneration
+        let completion: HistoryStoreClient.Completion<HistoryPageDto> = { [weak self] result in
+            guard let self, generation == self.searchGeneration else { return }
+            self.isLoadingPage = false
+            switch result {
+            case let .success(page):
+                self.apply(page: page, reset: false)
+            case let .failure(error):
+                self.show(error: error)
+            }
+        }
+        if let query = activeSearchQuery {
+            storeClient.searchPage(
+                query: query,
+                mode: activeSearchMode,
+                cursor: cursor,
+                limit: pageSize,
+                completion: completion
+            )
+        } else {
+            storeClient.recentPage(cursor: cursor, limit: pageSize, completion: completion)
+        }
+    }
+
+    private func visibleAnchor() -> (id: Int64, offset: CGFloat)? {
+        guard let historyClipView else { return nil }
+        let row = tableView.row(at: NSPoint(x: 1, y: tableView.visibleRect.minY + 1))
+        guard historyRows.indices.contains(row) else { return nil }
+        return (
+            historyRows[row].id,
+            historyClipView.bounds.minY - tableView.rect(ofRow: row).minY
+        )
+    }
+
+    private func restoreVisibleAnchor(_ anchor: (id: Int64, offset: CGFloat)) {
+        guard
+            let historyClipView,
+            let row = historyRows.firstIndex(where: { $0.id == anchor.id })
+        else { return }
+        var origin = historyClipView.bounds.origin
+        origin.y = max(0, tableView.rect(ofRow: row).minY + anchor.offset)
+        historyClipView.setBoundsOrigin(origin)
+        historyClipView.enclosingScrollView?.reflectScrolledClipView(historyClipView)
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {

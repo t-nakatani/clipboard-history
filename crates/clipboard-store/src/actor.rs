@@ -5,8 +5,8 @@ use std::{
 };
 
 use clipboard_core::{
-    ClipCandidate, ClipId, ClipSummary, HistoryRepository, ImagePreview, PlannedQuery,
-    Representation, UpsertOutcome,
+    ClipCandidate, ClipId, HistoryCursor, HistoryPage, HistoryRepository, ImagePreview,
+    PlannedQuery, Representation, UpsertOutcome,
 };
 use rusqlite::Connection;
 
@@ -55,13 +55,18 @@ pub struct CheckpointResult {
 
 enum Command {
     Upsert(ClipCandidate, Sender<Result<UpsertOutcome, StoreError>>),
-    Recent(usize, Sender<Result<Vec<ClipSummary>, StoreError>>),
+    RecentPage(
+        Option<HistoryCursor>,
+        usize,
+        Sender<Result<HistoryPage, StoreError>>,
+    ),
     Representations(ClipId, Sender<Result<Vec<Representation>, StoreError>>),
     ImagePreview(ClipId, Sender<Result<Option<ImagePreview>, StoreError>>),
-    Search(
+    SearchPage(
         PlannedQuery,
+        Option<HistoryCursor>,
         usize,
-        Sender<Result<Vec<ClipSummary>, StoreError>>,
+        Sender<Result<HistoryPage, StoreError>>,
     ),
     QuickCheck(Sender<Result<(), StoreError>>),
     Stats(Sender<Result<StoreStats, StoreError>>),
@@ -171,10 +176,14 @@ impl HistoryRepository for StoreHandle {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    fn recent(&self, limit: usize) -> Result<Vec<ClipSummary>, Self::Error> {
+    fn recent_page(
+        &self,
+        cursor: Option<HistoryCursor>,
+        limit: usize,
+    ) -> Result<HistoryPage, Self::Error> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::Recent(limit, reply))
+            .send(Command::RecentPage(cursor, limit, reply))
             .map_err(|_| StoreError::ActorStopped)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -195,10 +204,15 @@ impl HistoryRepository for StoreHandle {
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
 
-    fn search(&self, query: PlannedQuery, limit: usize) -> Result<Vec<ClipSummary>, Self::Error> {
+    fn search_page(
+        &self,
+        query: PlannedQuery,
+        cursor: Option<HistoryCursor>,
+        limit: usize,
+    ) -> Result<HistoryPage, Self::Error> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::Search(query, limit, reply))
+            .send(Command::SearchPage(query, cursor, limit, reply))
             .map_err(|_| StoreError::ActorStopped)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -280,9 +294,9 @@ fn run_actor(
                     }
                 }
             }
-            Command::Recent(limit, reply) => {
+            Command::RecentPage(cursor, limit, reply) => {
                 // The SELECT owns no transaction beyond this single request.
-                let _ = reply.send(repository::recent(&connection, limit));
+                let _ = reply.send(repository::recent_page(&connection, cursor, limit));
             }
             Command::Representations(id, reply) => {
                 let result = repository::representations(
@@ -296,8 +310,8 @@ fn run_actor(
             Command::ImagePreview(id, reply) => {
                 let _ = reply.send(repository::image_preview(&connection, id));
             }
-            Command::Search(query, limit, reply) => {
-                let _ = reply.send(repository::search(&connection, query, limit));
+            Command::SearchPage(query, cursor, limit, reply) => {
+                let _ = reply.send(repository::search_page(&connection, query, cursor, limit));
             }
             Command::QuickCheck(reply) => {
                 let result = connection
@@ -704,6 +718,178 @@ mod tests {
             .unwrap();
         assert_eq!(literal_underscore.len(), 1);
         assert_eq!(literal_underscore[0].preview.as_deref(), Some("a_b"));
+
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn keyset_pages_remain_ordered_across_equal_timestamps_and_mutations() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-keyset-test-{unique}"));
+        let service = HistoryService::new(
+            StoreHandle::open(StoreOptions::new(
+                root.join("history.sqlite"),
+                root.join("payloads"),
+            ))
+            .unwrap(),
+            SearchTextPolicy::default(),
+        );
+        for (timestamp, value) in [
+            (30, "item-6"),
+            (30, "item-5"),
+            (20, "item-4"),
+            (20, "item-3"),
+            (10, "item-2"),
+            (10, "item-1"),
+        ] {
+            service
+                .capture(
+                    ClipboardSnapshot {
+                        representations: vec![Representation {
+                            uti: "public.utf8-plain-text".into(),
+                            bytes: value.as_bytes().to_vec(),
+                        }],
+                        image_preview: None,
+                    },
+                    ClipKind::Text,
+                    timestamp,
+                )
+                .unwrap();
+        }
+
+        let original = service.repository().recent(10).unwrap();
+        let deleted_id = original[4].id;
+        let recopy_id = original.last().unwrap().id;
+        let first = service.repository().recent_page(None, 2).unwrap();
+        assert!(first.has_more);
+        assert_eq!(first.items.len(), 2);
+        assert_eq!(first.items[0].last_used_at_ms, 30);
+        assert_eq!(first.items[1].last_used_at_ms, 30);
+
+        // A newer capture must not shift the continuation as OFFSET would.
+        service
+            .capture(
+                ClipboardSnapshot {
+                    representations: vec![Representation {
+                        uti: "public.utf8-plain-text".into(),
+                        bytes: b"new-head".to_vec(),
+                    }],
+                    image_preview: None,
+                },
+                ClipKind::Text,
+                100,
+            )
+            .unwrap();
+        service.repository().delete(deleted_id).unwrap();
+        let second = service
+            .repository()
+            .recent_page(first.next_cursor, 2)
+            .unwrap();
+        let third = service
+            .repository()
+            .recent_page(second.next_cursor, 2)
+            .unwrap();
+
+        let ids: Vec<_> = first
+            .items
+            .iter()
+            .chain(&second.items)
+            .chain(&third.items)
+            .map(|item| item.id)
+            .collect();
+        let unique_ids: std::collections::HashSet<_> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), 5);
+        assert_eq!(unique_ids.len(), 5);
+        assert!(!third.has_more);
+        assert!(third.next_cursor.is_none());
+        assert!(!ids.contains(&service.repository().recent(1).unwrap()[0].id));
+        assert!(!ids.contains(&deleted_id));
+
+        // Recopy moves an old row above the cursor. The app responds by
+        // resetting the first page from this capture event.
+        service
+            .capture(
+                ClipboardSnapshot {
+                    representations: vec![Representation {
+                        uti: "public.utf8-plain-text".into(),
+                        bytes: b"item-2".to_vec(),
+                    }],
+                    image_preview: None,
+                },
+                ClipKind::Text,
+                101,
+            )
+            .unwrap();
+        let reset = service.repository().recent_page(None, 2).unwrap();
+        assert_eq!(reset.items[0].id, recopy_id);
+        assert_eq!(reset.items[0].copy_count, 2);
+
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_uses_the_same_keyset_cursor_for_every_page() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-search-page-test-{unique}"));
+        let service = HistoryService::new(
+            StoreHandle::open(StoreOptions::new(
+                root.join("history.sqlite"),
+                root.join("payloads"),
+            ))
+            .unwrap(),
+            SearchTextPolicy::default(),
+        );
+        for index in 0..7 {
+            service
+                .capture(
+                    ClipboardSnapshot {
+                        representations: vec![Representation {
+                            uti: "public.utf8-plain-text".into(),
+                            bytes: format!("alpha-{index}").into_bytes(),
+                        }],
+                        image_preview: None,
+                    },
+                    ClipKind::Text,
+                    100 - index / 2,
+                )
+                .unwrap();
+        }
+
+        let mut cursor = None;
+        let mut results = Vec::new();
+        loop {
+            let page = service
+                .search_page("alpha-", clipboard_core::MatchMode::Prefix, cursor, 3)
+                .unwrap();
+            results.extend(page.items);
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        assert_eq!(results.len(), 7);
+        assert_eq!(
+            results
+                .iter()
+                .map(|item| item.id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            7
+        );
+        assert!(
+            results
+                .windows(2)
+                .all(|pair| (pair[0].last_used_at_ms, pair[0].id.0)
+                    > (pair[1].last_used_at_ms, pair[1].id.0))
+        );
 
         drop(service);
         std::fs::remove_dir_all(root).unwrap();

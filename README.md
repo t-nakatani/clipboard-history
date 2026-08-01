@@ -54,7 +54,7 @@
 | soak中の最大WAL | 6.55MB |
 | 100,000 payloadの孤児scan | 約2.5秒・追加RSS約0.7MB |
 
-詳細は[最初のPoC結果](experiments/clipboard-history-poc/RESULTS.md)、[PoC 0002](docs/experiments/0002-results.md)、[PoC 0003](docs/experiments/0003-soak-results.md)、[画像preview PoC](docs/experiments/0004-image-preview-results.md)を参照してください。
+詳細は[最初のPoC結果](experiments/clipboard-history-poc/RESULTS.md)、[PoC 0002](docs/experiments/0002-results.md)、[PoC 0003](docs/experiments/0003-soak-results.md)、[画像preview PoC](docs/experiments/0004-image-preview-results.md)、[keyset paging PoC](docs/experiments/0005-keyset-paging-results.md)を参照してください。
 
 ## アーキテクチャ
 
@@ -165,6 +165,7 @@ clipboard-history/
 6. [メニューバーからの1クリック表示](docs/architecture/decisions/0006-one-click-history-panel.md)
 7. [画像preview pipeline](docs/architecture/decisions/0007-image-preview-pipeline.md)
 8. [履歴panelの表示密度](docs/architecture/decisions/0008-history-panel-density.md)
+9. [履歴のkeyset paging](docs/architecture/decisions/0009-keyset-paging.md)
 
 ## 次の優先事項
 
