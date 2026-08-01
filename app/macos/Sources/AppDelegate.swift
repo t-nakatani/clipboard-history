@@ -383,6 +383,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func scheduleSearch() {
+        // Typing is activity even though the request is still debounced. Waiting
+        // for performSearch would leave a window in which the scheduler still
+        // believes the app is deep idle and can put an FTS optimize on the store
+        // queue that the imminent search then has to wait behind.
+        markStoreActivity()
         searchTimer?.invalidate()
         searchTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: false) { [weak self] _ in
             self?.performSearch()
