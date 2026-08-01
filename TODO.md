@@ -6,21 +6,6 @@
 
 ## P0: プロジェクトの価値を成立させる
 
-### 履歴のkeyset paging
-
-- [x] recent一覧にcursorを導入する
-  - [x] `(last_used_at, id)`をcursorとしてRust APIへ追加する
-  - [x] UniFFI DTOへ方向、`has_more`、bounded scan用`continuation_cursor`と`truncated`を追加する
-  - [x] scroll上下端で前後50件を非同期取得する
-  - [x] Swiftが保持するsummaryを最大100〜200件に制限する
-  - [x] 古いpageを解放してもscroll位置を維持する
-  - [x] 解放した新しいpageへ上方向のcursorで戻れる
-- [x] search結果にも同じpagingモデルを適用する
-  - [x] 疎な短文検索で2000行の空windowを越えて継続する
-- [x] capture、delete、recopy発生中も重複・欠落しないことをテストする
-
-完了条件: 100,000件の履歴を、全件をメモリへ載せず最後まで辿れる。
-
 ### 自己再captureの抑止
 
 - [ ] 履歴復元によるPasteboard更新をmonitorが再保存しない仕組みを決める
@@ -28,16 +13,6 @@
 - [ ] 通常の再copyは従来どおり`recopy = touch`になることをテストする
 
 完了条件: 履歴を復元しても`copy_count`と並び順が意図せず変化しない。
-
-### 起動時recovery
-
-- [ ] `recover_orphans`をUniFFIへ公開する
-- [ ] unclean shutdownを判定するmarkerを追加する
-- [ ] unclean shutdown後だけbackground orphan scanを実行する
-- [ ] recovery中もpanelと最近の履歴を開けるようにする
-- [ ] quick check失敗時にDBを隔離し、再構築できる回復経路を作る
-
-完了条件: crash後の再起動でdangling referenceを作らず、孤児fileを回収できる。
 
 ### ユーザーへ見えるエラー表示
 
@@ -63,7 +38,8 @@
 ### ストレージmaintenance
 
 - [ ] 定期的なpassive WAL checkpointを接続する
-- [ ] idle時またはclean shutdown時にtruncate checkpointを実行する
+- [x] clean shutdown時にtruncate checkpointを実行する
+- [ ] idle時にtruncate checkpointを実行する
 - [ ] idle時のincremental vacuumを接続する
 - [ ] 条件付きでFTS5 optimizeを実行する
 - [ ] maintenanceがcapture/searchのp95を悪化させないことを測る
@@ -182,3 +158,13 @@
 - [x] text/image別row height
 - [x] 非同期画像previewと上限付きcache
 - [x] UI寸法のconfiguration集約
+- [x] recent/searchの双方向keyset paging
+  - [x] 50件単位で上下方向へ移動し、summary保持を最大200件に制限
+  - [x] scroll位置を維持したまま解放済みpageへ戻る
+  - [x] bounded scanの`truncated`と`continuation_cursor`で疎な短文検索を継続
+  - [x] capture、delete、recopy中の重複・欠落・並び順を回帰テスト
+- [x] 起動時recovery
+  - [x] clean/unclean shutdown markerとUniFFI recovery API
+  - [x] unclean時だけbackgroundでquick check、queued GC、orphan scanを実行
+  - [x] recovery前にrecentを読み、panel表示をscan完了で待たせない
+  - [x] 破損DB・WAL/SHM・payloadをdurable manifestで隔離・再開して空storeを再構築
