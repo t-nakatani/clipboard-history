@@ -105,6 +105,13 @@ pub fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
                 tokenize='trigram'
             );
 
+            -- FTS5 segments are append-only, so a plain delete leaves a tombstone
+            -- and keeps the original trigrams in clips_fts_data where PRAGMA
+            -- secure_delete cannot reach them. This option makes FTS5 rewrite the
+            -- affected segment instead. It is stored in clips_fts_config and is
+            -- therefore persistent across connections.
+            INSERT INTO clips_fts(clips_fts, rank) VALUES('secure-delete', 1);
+
             CREATE TRIGGER clips_fts_insert AFTER INSERT ON clips
             WHEN new.normalized_text IS NOT NULL
             BEGIN
@@ -149,16 +156,37 @@ pub fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
     }
     if version == 2 {
         // Databases written before secure_delete was enabled can still hold
-        // plaintext in free pages. A one-time full VACUUM rewrites the file
-        // without them; the following checkpoint truncates the WAL so the old
-        // pages do not survive there either. This is the only place a full
-        // VACUUM runs, and the version bump guards it against repeating.
+        // plaintext in free pages, and their FTS5 segments still hold the
+        // trigrams of every text clip ever deleted.
+        if has_table(connection, "clips_fts")? {
+            // Order matters. Enabling the option only governs future deletes, so
+            // the index is rebuilt from the surviving clips rows to drop the
+            // legacy segments and tombstones, and only then does VACUUM evict the
+            // pages they occupied from the file.
+            connection.execute_batch(
+                "INSERT INTO clips_fts(clips_fts, rank) VALUES('secure-delete', 1);
+                 INSERT INTO clips_fts(clips_fts) VALUES('rebuild');",
+            )?;
+        }
+        // A one-time full VACUUM rewrites the file without the freed pages; the
+        // following checkpoint truncates the WAL so they do not survive there
+        // either. This is the only place a full VACUUM runs, and the version bump
+        // guards it against repeating.
         connection.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
         connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         version = CURRENT_SCHEMA_VERSION;
     }
     debug_assert_eq!(version, CURRENT_SCHEMA_VERSION);
     Ok(())
+}
+
+fn has_table(connection: &Connection, name: &str) -> Result<bool, StoreError> {
+    let count: i64 = connection.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 #[cfg(test)]
@@ -252,6 +280,118 @@ mod tests {
             return false;
         };
         bytes.windows(needle.len()).any(|window| window == needle)
+    }
+
+    #[test]
+    fn version_two_migration_rebuilds_fts_and_drops_legacy_trigrams() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("clipboard-legacy-fts-{unique}"));
+        // Rare trigrams; the FTS5 trigram tokenizer only ever stores three
+        // character tokens, so the whole string would never be found in the index.
+        let deleted = format!("deleted-zqxjvw-{unique}");
+        let kept = format!("kept-wjvxqz-{unique}");
+        let deleted_trigrams = ["zqx", "qxj", "xjv", "jvw"];
+
+        // A version 2 database: external content FTS5 without the secure-delete
+        // option, holding one clip that was already deleted the legacy way.
+        let mut connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA secure_delete=OFF;
+                 CREATE TABLE clips (id INTEGER PRIMARY KEY, normalized_text TEXT);
+                 CREATE TABLE clip_previews (clip_id INTEGER PRIMARY KEY);
+                 CREATE VIRTUAL TABLE clips_fts USING fts5(
+                     normalized_text,
+                     content='clips',
+                     content_rowid='id',
+                     tokenize='trigram'
+                 );
+                 INSERT INTO clips(id, normalized_text) VALUES (1, '{deleted}'), (2, '{kept}');
+                 INSERT INTO clips_fts(rowid, normalized_text)
+                     SELECT id, normalized_text FROM clips;
+                 INSERT INTO clips_fts(clips_fts, rowid, normalized_text)
+                     VALUES ('delete', 1, '{deleted}');
+                 DELETE FROM clips WHERE id = 1;
+                 PRAGMA user_version=2;
+                 PRAGMA wal_checkpoint(TRUNCATE);"
+            ))
+            .unwrap();
+        for trigram in deleted_trigrams {
+            assert!(
+                file_contains(&path, trigram.as_bytes()),
+                "legacy FTS segments should still hold {trigram} before migrating"
+            );
+        }
+
+        configure_connection(&connection, 1024).unwrap();
+        migrate(&mut connection).unwrap();
+
+        for trigram in deleted_trigrams {
+            assert!(
+                !file_contains(&path, trigram.as_bytes()),
+                "migration left the legacy trigram {trigram} in the file"
+            );
+        }
+        // The rebuild must preserve the clip that was never deleted.
+        let hits: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM clips_fts WHERE clips_fts MATCH ?1",
+                [format!("\"{kept}\"")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1);
+
+        // Deletes made after the migration are covered by the persisted option.
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO clips_fts(clips_fts, rowid, normalized_text)
+                     VALUES ('delete', 2, '{kept}');
+                 DELETE FROM clips WHERE id = 2;
+                 PRAGMA wal_checkpoint(TRUNCATE);"
+            ))
+            .unwrap();
+        assert!(!file_contains(&path, b"wjv"));
+
+        drop(connection);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn fts_secure_delete_option_survives_reopening() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("clipboard-fts-option-{unique}"));
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection, 1024).unwrap();
+        migrate(&mut connection).unwrap();
+        drop(connection);
+
+        // The option lives in the clips_fts_config shadow table, so a fresh
+        // connection that never sets it must still observe it.
+        let reopened = Connection::open(&path).unwrap();
+        configure_connection(&reopened, 1024).unwrap();
+        let value: i64 = reopened
+            .query_row(
+                "SELECT v FROM clips_fts_config WHERE k = 'secure-delete'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, 1);
+
+        drop(reopened);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[test]

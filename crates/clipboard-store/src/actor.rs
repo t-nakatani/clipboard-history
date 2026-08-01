@@ -690,7 +690,12 @@ mod tests {
             StoreHandle::open(options).unwrap(),
             SearchTextPolicy::default(),
         );
-        let secret = format!("secret-passphrase-{unique}-do-not-linger");
+        // The FTS5 trigram tokenizer indexes three-character tokens, so scanning
+        // only for the whole secret would miss index residue entirely. The secret
+        // embeds letter runs whose trigrams ("zqx", "qxj", "xjv", "jvw") are rare
+        // enough that a stray match in a small SQLite file is implausible.
+        let secret = format!("secret-passphrase-zqxjvw-{unique}-do-not-linger");
+        let secret_trigrams = ["zqx", "qxj", "xjv", "jvw"];
         let preview_marker: Vec<u8> = format!("preview-marker-{unique}").into_bytes();
         let external_marker: Vec<u8> = format!("external-marker-{unique}")
             .into_bytes()
@@ -726,6 +731,12 @@ mod tests {
             file_contains(&database_path, secret.as_bytes()),
             "the test is only meaningful if the clip really reached the file"
         );
+        for trigram in secret_trigrams {
+            assert!(
+                file_contains(&database_path, trigram.as_bytes()),
+                "expected the trigram index to hold {trigram} before the delete"
+            );
+        }
 
         assert!(service.repository().delete(stored.id).unwrap());
         service.repository().collect_garbage(100).unwrap();
@@ -733,17 +744,21 @@ mod tests {
         service.repository().incremental_vacuum(4096).unwrap();
         service.repository().checkpoint_truncate().unwrap();
 
-        // secure_delete zeroes the freed cells, so neither the row text, the FTS
-        // trigram index nor the preview blob may remain in the live file or WAL.
+        // secure_delete zeroes the freed cells and the FTS5 secure-delete option
+        // rewrites the segment blobs, so neither the row text, the trigram tokens
+        // nor the preview blob may remain in the live file or WAL.
+        let mut needles: Vec<&[u8]> = vec![secret.as_bytes(), preview_marker.as_slice()];
+        needles.extend(secret_trigrams.iter().map(|trigram| trigram.as_bytes()));
         for path in [
             database_path.clone(),
             PathBuf::from(format!("{}-wal", database_path.display())),
         ] {
-            for needle in [secret.as_bytes(), preview_marker.as_slice()] {
+            for needle in &needles {
                 assert!(
                     !file_contains(&path, needle),
-                    "{} still contains deleted clip content",
-                    path.display()
+                    "{} still contains deleted clip content {:?}",
+                    path.display(),
+                    String::from_utf8_lossy(needle)
                 );
             }
         }
@@ -753,7 +768,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    fn file_contains(path: &Path, needle: &[u8]) -> bool {
+    fn file_contains(path: &std::path::Path, needle: &[u8]) -> bool {
         let Ok(bytes) = std::fs::read(path) else {
             return false;
         };

@@ -119,7 +119,8 @@ impl PayloadStore {
         // copy-on-write filesystems such as APFS the write may land on new blocks
         // and leave the originals readable until they are reused, and existing
         // snapshots, Time Machine backups and iCloud copies keep their own data.
-        // Overwrite failures must not block deletion, so they are ignored.
+        // Overwrite failures must not block deletion, so they are ignored; a path
+        // that is not a regular file is simply unlinked as before.
         let _ = zero_file(&path);
         match fs::remove_file(&path) {
             Ok(()) => Ok(true),
@@ -509,6 +510,28 @@ mod tests {
         assert!(!stored.path.exists());
         assert_eq!(fs::read(&witness).unwrap(), vec![0_u8; secret.len()]);
         assert!(!store.remove_if_exists(stored.hash).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_does_not_overwrite_through_a_symlink() {
+        let root = temp_root("remove-symlink");
+        let store = PayloadStore::new(&root);
+        let hash = PayloadHash::of(b"anything");
+        let payload_path = store.path_for(hash);
+        fs::create_dir_all(payload_path.parent().unwrap()).unwrap();
+
+        // An attacker replaces the payload path with a link to an unrelated file.
+        let outsider = root.join("outsider");
+        fs::write(&outsider, b"untouchable").unwrap();
+        std::os::unix::fs::symlink(&outsider, &payload_path).unwrap();
+
+        assert!(store.remove_if_exists(hash).unwrap());
+
+        // The link is gone, but the file it pointed at keeps its contents.
+        assert!(!payload_path.exists());
+        assert_eq!(fs::read(&outsider).unwrap(), b"untouchable");
         fs::remove_dir_all(root).unwrap();
     }
 }
