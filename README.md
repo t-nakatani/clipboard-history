@@ -54,7 +54,7 @@
 | soak中の最大WAL | 6.55MB |
 | 100,000 payloadの孤児scan | 約2.5秒・追加RSS約0.7MB |
 
-詳細は[最初のPoC結果](experiments/clipboard-history-poc/RESULTS.md)、[PoC 0002](docs/experiments/0002-results.md)、[PoC 0003](docs/experiments/0003-soak-results.md)を参照してください。
+詳細は[最初のPoC結果](experiments/clipboard-history-poc/RESULTS.md)、[PoC 0002](docs/experiments/0002-results.md)、[PoC 0003](docs/experiments/0003-soak-results.md)、[画像preview PoC](docs/experiments/0004-image-preview-results.md)を参照してください。
 
 ## アーキテクチャ
 
@@ -125,6 +125,7 @@ GitHub Actionsではpush、pull request、手動実行に対して次を検証�
 - Rust format、Clippy、workspace test、release build
 - 独立ストレージPoCのClippy、test、release build
 - macOS 14でのRust/UniFFI/Swift app buildとセルフテスト
+- production実装を使った画像preview PoCのsmoke test
 - unsigned appの7日間artifact保存
 
 Rust toolchainは[rust-toolchain.toml](rust-toolchain.toml)で1.88.0へ固定しています。CargoとGitHub Actionsの更新はDependabotが毎週確認します。

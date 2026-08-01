@@ -72,6 +72,12 @@ jobs:
       - name: Build app and run Swift/UniFFI self-test
         run: ./app/macos/build-macos-app.sh
 
+      - name: Smoke-test image preview PoC
+        env:
+          IMAGE_PREVIEW_ITERATIONS: 5
+          IMAGE_PREVIEW_STORAGE_ROWS: 1000
+        run: ./experiments/run-image-preview-poc.sh
+
       - name: Package unsigned app
         run: |
           ditto -c -k --sequesterRsrc --keepParent \

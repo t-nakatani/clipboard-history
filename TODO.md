@@ -76,11 +76,14 @@
 
 ### 画像previewの検証
 
-- [ ] 写真、スクリーンショット、透過画像のfixtureを用意する
-- [ ] 96px・JPEG品質0.58の生成時間と容量分布を測る
-- [ ] 100,000画像時のDB容量を推定・測定する
-- [ ] 必要ならpreviewをSQLite BLOBからCASへ分離する
-- [ ] 既存画像の安全なオンデマンドbackfill方針を決める
+- [x] 写真、スクリーンショット、透過画像のfixtureを用意する
+- [x] 96px・JPEG品質0.58の生成時間と容量分布を測る
+- [x] 100,000画像時のDB容量を推定・測定する
+- [x] SQLite BLOBとCAS分離を比較し、現時点ではSQLite BLOB継続と判断する
+- [x] 既存画像は一括backfillせず、再copy時に補完する方針を決める
+- [ ] alphaを持つ画像だけPNG previewへ切り替え、dark panel上の白背景化を防ぐ
+
+測定結果: [PoC 0004](docs/experiments/0004-image-preview-results.md)
 
 ### キーボード操作
 

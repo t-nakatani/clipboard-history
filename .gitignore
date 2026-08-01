@@ -2,6 +2,7 @@
 /app/macos/Generated/
 /app/macos/build/
 /experiments/clipboard-history-poc/results/*.sqlite
+/experiments/results/image-preview-*/
 /.rust-review-results/
 .DS_Store
 *.sqlite-shm
