@@ -91,7 +91,7 @@ Rustは意味のある境界だけを残した3クレート構成です。
 ## 必要環境
 
 - macOS 13以降
-- Rust 1.88以降
+- Rust 1.95以降
 - XcodeまたはXcode Command Line Tools
 - Swift 5.9以降
 
@@ -128,7 +128,7 @@ GitHub Actionsではpush、pull request、手動実行に対して次を検証�
 - production実装を使った画像preview PoCのsmoke test
 - unsigned appの7日間artifact保存
 
-Rust toolchainは[rust-toolchain.toml](rust-toolchain.toml)で1.88.0へ固定しています。CargoとGitHub Actionsの更新はDependabotが毎週確認します。
+Rust toolchainは[rust-toolchain.toml](rust-toolchain.toml)で1.95.0へ固定しています。`rusqlite 0.40`のbundled SQLite buildが利用する`cfg_select!`に対応するためです。CargoとGitHub Actionsの更新はDependabotが毎週確認します。
 
 ## UIの調整
 
