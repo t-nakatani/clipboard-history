@@ -93,10 +93,15 @@ pub struct HistoryCursor {
     pub id: ClipId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageDirection {
+    Older,
+    Newer,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoryPage {
     pub items: Vec<ClipSummary>,
-    pub next_cursor: Option<HistoryCursor>,
     pub has_more: bool,
 }
 

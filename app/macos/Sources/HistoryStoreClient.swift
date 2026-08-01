@@ -42,7 +42,7 @@ final class HistoryStoreClient {
                     imagePreview: imagePreview,
                     copiedAtMs: copiedAtMs
                 )
-                let recentPage = try engine.recentPage(cursor: nil, limit: 50)
+                let recentPage = try engine.recentPage(cursor: nil, direction: .older, limit: 50)
                 return PersistedCapture(result: stored, recentPage: recentPage)
             }
             DispatchQueue.main.async { completion(result) }
@@ -58,11 +58,14 @@ final class HistoryStoreClient {
 
     func recentPage(
         cursor: HistoryCursorDto? = nil,
+        direction: PageDirectionDto = .older,
         limit: UInt32 = 50,
         completion: @escaping Completion<HistoryPageDto>
     ) {
         queue.async { [engine] in
-            let result = Result { try engine.recentPage(cursor: cursor, limit: limit) }
+            let result = Result {
+                try engine.recentPage(cursor: cursor, direction: direction, limit: limit)
+            }
             DispatchQueue.main.async { completion(result) }
         }
     }
@@ -85,12 +88,19 @@ final class HistoryStoreClient {
         query: String,
         mode: SearchModeDto,
         cursor: HistoryCursorDto? = nil,
+        direction: PageDirectionDto = .older,
         limit: UInt32 = 50,
         completion: @escaping Completion<HistoryPageDto>
     ) {
         queue.async { [engine] in
             let result = Result {
-                try engine.searchPage(query: query, mode: mode, cursor: cursor, limit: limit)
+                try engine.searchPage(
+                    query: query,
+                    mode: mode,
+                    cursor: cursor,
+                    direction: direction,
+                    limit: limit
+                )
             }
             DispatchQueue.main.async { completion(result) }
         }

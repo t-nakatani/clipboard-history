@@ -34,7 +34,7 @@
 
 ### 現在の制約
 
-- UIが取得する履歴は最近50件までで、keyset pagingは未接続
+- UIは50件単位の双方向keyset pagingを使い、summaryは最大200件だけを保持
 - 複数Pasteboard itemは先頭itemだけを保存
 - ディスク容量上限、pin、定期checkpoint/vacuumはアプリ経路へ未接続
 - global shortcutと設定画面は未実装
@@ -171,9 +171,8 @@ clipboard-history/
 
 詳細なチェックリストと完了条件は[TODO.md](TODO.md)で管理します。
 
-1. recent/searchのkeyset pagingをアプリ経路へ接続する
-2. 復元時の自己再captureを抑止する
-3. 起動時の孤児payload recoveryとidle maintenanceを接続する
-4. 画像込み100,000件でアプリ全体のRSSと描画時間を測定する
-5. global shortcut、エラー表示、設定画面を追加する
-6. ディスク容量retention、pin、配布工程を整備する
+1. 復元時の自己再captureを抑止する
+2. 起動時の孤児payload recoveryとidle maintenanceを接続する
+3. 画像込み100,000件でアプリ全体のRSSと描画時間を測定する
+4. global shortcut、エラー表示、設定画面を追加する
+5. ディスク容量retention、pin、配布工程を整備する

@@ -10,10 +10,11 @@
 
 - [x] recent一覧にcursorを導入する
   - [x] `(last_used_at, id)`をcursorとしてRust APIへ追加する
-  - [x] UniFFI DTOへ次cursorと`has_more`を追加する
-  - [x] scroll末尾で次の50件を非同期取得する
+  - [x] UniFFI DTOへ方向と方向別`has_more`を追加する
+  - [x] scroll上下端で前後50件を非同期取得する
   - [x] Swiftが保持するsummaryを最大100〜200件に制限する
   - [x] 古いpageを解放してもscroll位置を維持する
+  - [x] 解放した新しいpageへ上方向のcursorで戻れる
 - [x] search結果にも同じpagingモデルを適用する
 - [x] capture、delete、recopy発生中も重複・欠落しないことをテストする
 

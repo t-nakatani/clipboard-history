@@ -6,7 +6,7 @@ use std::{
 
 use clipboard_core::{
     ClipCandidate, ClipId, HistoryCursor, HistoryPage, HistoryRepository, ImagePreview,
-    PlannedQuery, Representation, UpsertOutcome,
+    PageDirection, PlannedQuery, Representation, UpsertOutcome,
 };
 use rusqlite::Connection;
 
@@ -57,6 +57,7 @@ enum Command {
     Upsert(ClipCandidate, Sender<Result<UpsertOutcome, StoreError>>),
     RecentPage(
         Option<HistoryCursor>,
+        PageDirection,
         usize,
         Sender<Result<HistoryPage, StoreError>>,
     ),
@@ -65,6 +66,7 @@ enum Command {
     SearchPage(
         PlannedQuery,
         Option<HistoryCursor>,
+        PageDirection,
         usize,
         Sender<Result<HistoryPage, StoreError>>,
     ),
@@ -179,11 +181,12 @@ impl HistoryRepository for StoreHandle {
     fn recent_page(
         &self,
         cursor: Option<HistoryCursor>,
+        direction: PageDirection,
         limit: usize,
     ) -> Result<HistoryPage, Self::Error> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::RecentPage(cursor, limit, reply))
+            .send(Command::RecentPage(cursor, direction, limit, reply))
             .map_err(|_| StoreError::ActorStopped)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -208,11 +211,12 @@ impl HistoryRepository for StoreHandle {
         &self,
         query: PlannedQuery,
         cursor: Option<HistoryCursor>,
+        direction: PageDirection,
         limit: usize,
     ) -> Result<HistoryPage, Self::Error> {
         let (reply, receiver) = mpsc::channel();
         self.sender
-            .send(Command::SearchPage(query, cursor, limit, reply))
+            .send(Command::SearchPage(query, cursor, direction, limit, reply))
             .map_err(|_| StoreError::ActorStopped)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
     }
@@ -294,9 +298,14 @@ fn run_actor(
                     }
                 }
             }
-            Command::RecentPage(cursor, limit, reply) => {
+            Command::RecentPage(cursor, direction, limit, reply) => {
                 // The SELECT owns no transaction beyond this single request.
-                let _ = reply.send(repository::recent_page(&connection, cursor, limit));
+                let _ = reply.send(repository::recent_page(
+                    &connection,
+                    cursor,
+                    direction,
+                    limit,
+                ));
             }
             Command::Representations(id, reply) => {
                 let result = repository::representations(
@@ -310,8 +319,14 @@ fn run_actor(
             Command::ImagePreview(id, reply) => {
                 let _ = reply.send(repository::image_preview(&connection, id));
             }
-            Command::SearchPage(query, cursor, limit, reply) => {
-                let _ = reply.send(repository::search_page(&connection, query, cursor, limit));
+            Command::SearchPage(query, cursor, direction, limit, reply) => {
+                let _ = reply.send(repository::search_page(
+                    &connection,
+                    query,
+                    cursor,
+                    direction,
+                    limit,
+                ));
             }
             Command::QuickCheck(reply) => {
                 let result = connection
@@ -764,7 +779,10 @@ mod tests {
         let original = service.repository().recent(10).unwrap();
         let deleted_id = original[4].id;
         let recopy_id = original.last().unwrap().id;
-        let first = service.repository().recent_page(None, 2).unwrap();
+        let first = service
+            .repository()
+            .recent_page(None, PageDirection::Older, 2)
+            .unwrap();
         assert!(first.has_more);
         assert_eq!(first.items.len(), 2);
         assert_eq!(first.items[0].last_used_at_ms, 30);
@@ -785,13 +803,15 @@ mod tests {
             )
             .unwrap();
         service.repository().delete(deleted_id).unwrap();
+        let first_cursor = cursor_for(first.items.last().unwrap());
         let second = service
             .repository()
-            .recent_page(first.next_cursor, 2)
+            .recent_page(Some(first_cursor), PageDirection::Older, 2)
             .unwrap();
+        let second_cursor = cursor_for(second.items.last().unwrap());
         let third = service
             .repository()
-            .recent_page(second.next_cursor, 2)
+            .recent_page(Some(second_cursor), PageDirection::Older, 2)
             .unwrap();
 
         let ids: Vec<_> = first
@@ -805,9 +825,20 @@ mod tests {
         assert_eq!(ids.len(), 5);
         assert_eq!(unique_ids.len(), 5);
         assert!(!third.has_more);
-        assert!(third.next_cursor.is_none());
         assert!(!ids.contains(&service.repository().recent(1).unwrap()[0].id));
         assert!(!ids.contains(&deleted_id));
+
+        let newer = service
+            .repository()
+            .recent_page(third.items.first().map(cursor_for), PageDirection::Newer, 2)
+            .unwrap();
+        assert_eq!(newer.items, second.items);
+        assert!(newer.has_more);
+        let newest_loaded = service
+            .repository()
+            .recent_page(newer.items.first().map(cursor_for), PageDirection::Newer, 2)
+            .unwrap();
+        assert_eq!(newest_loaded.items, first.items);
 
         // Recopy moves an old row above the cursor. The app responds by
         // resetting the first page from this capture event.
@@ -824,7 +855,10 @@ mod tests {
                 101,
             )
             .unwrap();
-        let reset = service.repository().recent_page(None, 2).unwrap();
+        let reset = service
+            .repository()
+            .recent_page(None, PageDirection::Older, 2)
+            .unwrap();
         assert_eq!(reset.items[0].id, recopy_id);
         assert_eq!(reset.items[0].copy_count, 2);
 
@@ -867,13 +901,20 @@ mod tests {
         let mut results = Vec::new();
         loop {
             let page = service
-                .search_page("alpha-", clipboard_core::MatchMode::Prefix, cursor, 3)
+                .search_page(
+                    "alpha-",
+                    clipboard_core::MatchMode::Prefix,
+                    cursor,
+                    PageDirection::Older,
+                    3,
+                )
                 .unwrap();
+            let next_cursor = page.items.last().map(cursor_for);
             results.extend(page.items);
             if !page.has_more {
                 break;
             }
-            cursor = page.next_cursor;
+            cursor = next_cursor;
         }
         assert_eq!(results.len(), 7);
         assert_eq!(
@@ -893,5 +934,67 @@ mod tests {
 
         drop(service);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_recent_scan_can_continue_past_the_first_two_thousand_rows() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-recent-scan-page-test-{unique}"));
+        let service = HistoryService::new(
+            StoreHandle::open(StoreOptions::new(
+                root.join("history.sqlite"),
+                root.join("payloads"),
+            ))
+            .unwrap(),
+            SearchTextPolicy::default(),
+        );
+        for index in 0..2_105 {
+            service
+                .capture(
+                    ClipboardSnapshot {
+                        representations: vec![Representation {
+                            uti: "public.utf8-plain-text".into(),
+                            bytes: format!("x-{index}").into_bytes(),
+                        }],
+                        image_preview: None,
+                    },
+                    ClipKind::Text,
+                    10_000 - index,
+                )
+                .unwrap();
+        }
+
+        let mut cursor = None;
+        let mut count = 0;
+        loop {
+            let page = service
+                .search_page(
+                    "x",
+                    clipboard_core::MatchMode::Substring,
+                    cursor,
+                    PageDirection::Older,
+                    50,
+                )
+                .unwrap();
+            cursor = page.items.last().map(cursor_for);
+            count += page.items.len();
+            if !page.has_more {
+                break;
+            }
+        }
+        assert_eq!(count, 2_105);
+
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn cursor_for(item: &clipboard_core::ClipSummary) -> HistoryCursor {
+        HistoryCursor {
+            last_used_at_ms: item.last_used_at_ms,
+            id: item.id,
+        }
     }
 }

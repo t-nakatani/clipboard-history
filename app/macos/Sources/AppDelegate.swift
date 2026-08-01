@@ -274,7 +274,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                     self?.searchGeneration += 1
                     self?.activeSearchQuery = nil
                     self?.isLoadingPage = false
-                    self?.apply(page: capture.recentPage, reset: true)
+                    if self?.panel?.isVisible == true, self?.isViewingAwayFromNewest == true {
+                        self?.pageWindow.markNewerAvailable()
+                        self?.statusLabel.stringValue = "新しい履歴あり"
+                    } else {
+                        self?.apply(page: capture.recentPage, reset: true)
+                    }
                 } else {
                     self?.performSearch()
                 }
@@ -374,12 +379,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
 
-    private func apply(page: HistoryPageDto, reset: Bool) {
+    private func apply(
+        page: HistoryPageDto,
+        reset: Bool,
+        direction: PageDirectionDto = .older
+    ) {
         let anchor = reset ? nil : visibleAnchor()
         let selectedId = historyRows.indices.contains(tableView.selectedRow)
             ? historyRows[tableView.selectedRow].id
             : nil
-        pageWindow.apply(page, reset: reset)
+        if reset {
+            pageWindow.reset(with: page)
+        } else {
+            switch direction {
+            case .older: pageWindow.appendOlder(page)
+            case .newer: pageWindow.prependNewer(page)
+            }
+        }
         tableView.reloadData()
         if let selectedId, let selectedRow = historyRows.firstIndex(where: { $0.id == selectedId }) {
             tableView.selectRowIndexes(IndexSet(integer: selectedRow), byExtendingSelection: false)
@@ -396,18 +412,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc private func historyBoundsDidChange() {
         let visibleRows = tableView.rows(in: tableView.visibleRect)
         guard visibleRows.location != NSNotFound else { return }
-        if NSMaxRange(visibleRows) >= max(0, historyRows.count - 10) {
-            loadNextPage()
+        if visibleRows.location <= 10, pageWindow.hasMoreNewer {
+            loadPage(.newer)
+        } else if NSMaxRange(visibleRows) >= max(0, historyRows.count - 10), pageWindow.hasMoreOlder {
+            loadPage(.older)
         }
     }
 
-    private func loadNextPage() {
-        guard
-            pageWindow.hasMore,
-            !isLoadingPage,
-            let cursor = pageWindow.nextCursor,
-            let storeClient
-        else { return }
+    private func loadPage(_ direction: PageDirectionDto) {
+        guard !isLoadingPage, let storeClient else { return }
+        let cursor: HistoryCursorDto?
+        switch direction {
+        case .older:
+            guard pageWindow.hasMoreOlder else { return }
+            cursor = pageWindow.olderAnchor
+        case .newer:
+            guard pageWindow.hasMoreNewer else { return }
+            cursor = pageWindow.newerAnchor
+        }
+        guard let cursor else { return }
         isLoadingPage = true
         let generation = searchGeneration
         let completion: HistoryStoreClient.Completion<HistoryPageDto> = { [weak self] result in
@@ -415,7 +438,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             self.isLoadingPage = false
             switch result {
             case let .success(page):
-                self.apply(page: page, reset: false)
+                self.apply(page: page, reset: false, direction: direction)
             case let .failure(error):
                 self.show(error: error)
             }
@@ -425,12 +448,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 query: query,
                 mode: activeSearchMode,
                 cursor: cursor,
+                direction: direction,
                 limit: pageSize,
                 completion: completion
             )
         } else {
-            storeClient.recentPage(cursor: cursor, limit: pageSize, completion: completion)
+            storeClient.recentPage(
+                cursor: cursor,
+                direction: direction,
+                limit: pageSize,
+                completion: completion
+            )
         }
+    }
+
+    private var isViewingAwayFromNewest: Bool {
+        if pageWindow.hasMoreNewer { return true }
+        let visibleRows = tableView.rows(in: tableView.visibleRect)
+        return visibleRows.location != NSNotFound && visibleRows.location > 10
     }
 
     private func visibleAnchor() -> (id: Int64, offset: CGFloat)? {

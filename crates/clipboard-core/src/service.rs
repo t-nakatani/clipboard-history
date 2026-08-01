@@ -73,9 +73,10 @@ impl<R: HistoryRepository> HistoryService<R> {
         query: &str,
         mode: MatchMode,
         cursor: Option<crate::HistoryCursor>,
+        direction: crate::PageDirection,
         limit: usize,
     ) -> Result<crate::HistoryPage, R::Error> {
         self.repository
-            .search_page(QueryPlanner.plan(query, mode), cursor, limit)
+            .search_page(QueryPlanner.plan(query, mode), cursor, direction, limit)
     }
 }

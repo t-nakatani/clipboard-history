@@ -37,25 +37,45 @@ func runBindingSelfTest() -> Int32 {
                 hasImagePreview: false
             )
         }
-        pageWindow.apply(
-            HistoryPageDto(
-                items: items,
-                nextCursor: HistoryCursorDto(
-                    lastUsedAtMs: Int64(1_000 - (start + 49)),
-                    id: Int64(start + 49)
-                ),
-                hasMore: pageIndex < 4
-            ),
-            reset: pageIndex == 0
-        )
+        let page = HistoryPageDto(items: items, hasMore: pageIndex < 4)
+        if pageIndex == 0 {
+            pageWindow.reset(with: page)
+        } else {
+            pageWindow.appendOlder(page)
+        }
     }
     guard
         pageWindow.rows.count == 200,
         pageWindow.rows.first?.id == 50,
         pageWindow.rows.last?.id == 249,
-        !pageWindow.hasMore
+        !pageWindow.hasMoreOlder,
+        pageWindow.hasMoreNewer
     else {
         fputs("bounded history page window did not evict the oldest loaded page\n", stderr)
+        return 1
+    }
+
+    let newestItems = (0 ..< 50).map { value in
+        ClipSummaryDto(
+            id: Int64(value),
+            kind: "text",
+            lastUsedAtMs: Int64(1_000 - value),
+            pinned: false,
+            copyCount: 1,
+            payloadSize: 1,
+            preview: "item-\(value)",
+            hasImagePreview: false
+        )
+    }
+    pageWindow.prependNewer(HistoryPageDto(items: newestItems, hasMore: false))
+    guard
+        pageWindow.rows.count == 200,
+        pageWindow.rows.first?.id == 0,
+        pageWindow.rows.last?.id == 199,
+        !pageWindow.hasMoreNewer,
+        pageWindow.hasMoreOlder
+    else {
+        fputs("bounded history page window could not return to newer pages\n", stderr)
         return 1
     }
 

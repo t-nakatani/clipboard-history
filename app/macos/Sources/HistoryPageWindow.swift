@@ -1,11 +1,11 @@
 import Foundation
 
-/// Bounded, deduplicating summary window. Cursor state always belongs to the
-/// oldest page currently reached, even after newer rows are evicted.
+/// Bounded, deduplicating summary window. Anchors are derived from the rows
+/// that remain in memory, so evicting either edge preserves both directions.
 struct HistoryPageWindow {
     private(set) var rows: [ClipSummaryDto] = []
-    private(set) var nextCursor: HistoryCursorDto?
-    private(set) var hasMore = false
+    private(set) var hasMoreOlder = false
+    private(set) var hasMoreNewer = false
     let maximumCount: Int
 
     init(maximumCount: Int) {
@@ -13,19 +13,43 @@ struct HistoryPageWindow {
         self.maximumCount = maximumCount
     }
 
-    mutating func apply(_ page: HistoryPageDto, reset: Bool) {
-        if reset {
-            rows = Array(page.items.prefix(maximumCount))
-        } else {
-            var known = Set(rows.map(\.id))
-            for item in page.items where known.insert(item.id).inserted {
-                rows.append(item)
-            }
-            if rows.count > maximumCount {
-                rows.removeFirst(rows.count - maximumCount)
-            }
+    var olderAnchor: HistoryCursorDto? { rows.last.map(Self.cursor) }
+    var newerAnchor: HistoryCursorDto? { rows.first.map(Self.cursor) }
+
+    mutating func reset(with page: HistoryPageDto) {
+        rows = Array(page.items.prefix(maximumCount))
+        hasMoreOlder = page.hasMore || page.items.count > maximumCount
+        hasMoreNewer = false
+    }
+
+    mutating func appendOlder(_ page: HistoryPageDto) {
+        var known = Set(rows.map(\.id))
+        rows.append(contentsOf: page.items.filter { known.insert($0.id).inserted })
+        if rows.count > maximumCount {
+            rows.removeFirst(rows.count - maximumCount)
+            hasMoreNewer = true
         }
-        nextCursor = page.nextCursor
-        hasMore = page.hasMore
+        hasMoreOlder = page.hasMore
+    }
+
+    mutating func prependNewer(_ page: HistoryPageDto) {
+        var known = Set(rows.map(\.id))
+        let additions = page.items.filter { known.insert($0.id).inserted }
+        rows.insert(contentsOf: additions, at: 0)
+        if rows.count > maximumCount {
+            rows.removeLast(rows.count - maximumCount)
+            hasMoreOlder = true
+        }
+        hasMoreNewer = page.hasMore
+    }
+
+    mutating func markNewerAvailable() {
+        if !rows.isEmpty {
+            hasMoreNewer = true
+        }
+    }
+
+    private static func cursor(_ item: ClipSummaryDto) -> HistoryCursorDto {
+        HistoryCursorDto(lastUsedAtMs: item.lastUsedAtMs, id: item.id)
     }
 }
