@@ -37,11 +37,15 @@ Accepted for experimentation
 
 継続運用ではpassive checkpointを定期実行し、物理WAL fileのtruncateはidleまたはclean shutdownに限定する。250,000操作でWAL fileは最大6.55MBに留まり、RSS増加は約0.41MBだった。
 
+実装ではSQLite操作を`clipboard-store` actorの`run_maintenance`へ集約する。macOSは45秒周期の`Periodic`、15秒以上操作がない`Idle`、3分以上操作がない`DeepIdle`を通知し、WALが4MiB以上ならpassive checkpoint、16MiB以上のidle時だけtruncate checkpointを行う。incremental vacuumはfreelistが2,048 page以上の場合に一回256 pageへ制限する。各処理は一つの短いactor commandとして実行し、要求の重複をmacOS scheduler側で抑止する。
+
 通常運用はWAL + `synchronous=NORMAL`とする。この設定の耐久性契約は「OSまたは電源障害時に直近数件を失う可能性を許容するが、正常にcommit済みの履歴を壊さない」である。最後の1件を必ず残すことより、capture latencyと書き込み量を優先する。
 
 ## Retention and free pages
 
 保持制限は件数と論理payload容量の両方に適用し、pinned rowを保護する。pruningは100 rowずつのtransactionへ分割し、interactive writeのtail latencyを抑える。削除pageはfreelistへ戻るだけなので、新規DBでは`auto_vacuum=INCREMENTAL`を有効化し、低優先度で`incremental_vacuum`を実行する。大量prune後はFTS5の`optimize`が必要だが約0.5秒かかるため、idle maintenanceとして稀に実行する。full `VACUUM`は採用しない。
+
+FTS5の削除済みsegment量は`maintenance_state.deleted_since_fts_optimize`で永続化し、削除が10,000行以上蓄積した`DeepIdle`時だけ`optimize`を実行する。optimize後にカウンタをtransaction内でゼロへ戻す。これにより再起動後も、軽いidle maintenanceと重いFTS再編成を区別できる。この表とカウント用triggerはschema version 4で追加する。
 
 ## Secure deletion
 
@@ -61,6 +65,8 @@ secure_delete導入前に作られたDBはfree pageに平文を残し、FTS5 seg
 - SSDのwear levelingとTRIM挙動により、物理媒体上の残留は制御できない。
 
 これらを前提に、より強い保証が必要な場合はfilesystem levelの暗号化（FileVault）に依存する。
+
+idle maintenanceのtruncate checkpointは、この最後のWAL残留を縮める役割も担う。secure deleteが零クリアしたpageは、checkpointされるまでWALに削除前のimageを残すため、maintenanceは性能だけの機構ではない。
 
 ## Migration and recovery
 

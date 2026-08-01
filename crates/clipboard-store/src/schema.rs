@@ -2,7 +2,38 @@ use rusqlite::Connection;
 
 use crate::StoreError;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+
+// Shared by the fresh install and the version 3 migration so the two paths
+// cannot drift. The triggers count deleted text rows because FTS5 only marks
+// them in the segments; the counter is what decides when an optimize is worth
+// its cost.
+const MAINTENANCE_STATE_SQL: &str = "
+    CREATE TABLE maintenance_state (
+        id                         INTEGER PRIMARY KEY CHECK (id = 1),
+        deleted_since_fts_optimize INTEGER NOT NULL DEFAULT 0,
+        last_fts_optimize_at       INTEGER NOT NULL DEFAULT 0
+    );
+
+    INSERT INTO maintenance_state(id) VALUES (1);
+
+    CREATE TRIGGER clips_fts_maintenance_delete AFTER DELETE ON clips
+    WHEN old.normalized_text IS NOT NULL
+    BEGIN
+        UPDATE maintenance_state
+        SET deleted_since_fts_optimize = deleted_since_fts_optimize + 1
+        WHERE id = 1;
+    END;
+
+    CREATE TRIGGER clips_fts_maintenance_update
+    AFTER UPDATE OF normalized_text ON clips
+    WHEN old.normalized_text IS NOT NULL
+    BEGIN
+        UPDATE maintenance_state
+        SET deleted_since_fts_optimize = deleted_since_fts_optimize + 1
+        WHERE id = 1;
+    END;
+";
 
 pub fn configure_connection(connection: &Connection, cache_kib: usize) -> Result<(), StoreError> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -137,6 +168,7 @@ pub fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
             END;
             ",
         )?;
+        transaction.execute_batch(MAINTENANCE_STATE_SQL)?;
         transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         transaction.commit()?;
         version = CURRENT_SCHEMA_VERSION;
@@ -173,7 +205,16 @@ pub fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         // either. This is the only place a full VACUUM runs, and the version bump
         // guards it against repeating.
         connection.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
-        connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+        connection.pragma_update(None, "user_version", 3)?;
+        version = 3;
+    }
+    if version == 3 {
+        // Idle maintenance needs to know how much FTS5 churn has accumulated
+        // across restarts, so the counter is a table rather than in-memory state.
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(MAINTENANCE_STATE_SQL)?;
+        transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+        transaction.commit()?;
         version = CURRENT_SCHEMA_VERSION;
     }
     debug_assert_eq!(version, CURRENT_SCHEMA_VERSION);
@@ -235,8 +276,8 @@ mod tests {
             .execute_batch(&format!(
                 "PRAGMA journal_mode=WAL;
                  PRAGMA secure_delete=OFF;
-                 CREATE TABLE clips (id INTEGER PRIMARY KEY, text TEXT);
-                 INSERT INTO clips(id, text) VALUES (1, '{secret}');
+                 CREATE TABLE clips (id INTEGER PRIMARY KEY, normalized_text TEXT);
+                 INSERT INTO clips(id, normalized_text) VALUES (1, '{secret}');
                  DELETE FROM clips;
                  PRAGMA user_version=2;
                  PRAGMA wal_checkpoint(TRUNCATE);"
@@ -261,7 +302,7 @@ mod tests {
         connection
             .execute_batch(&format!(
                 "PRAGMA secure_delete=OFF;
-                 INSERT INTO clips(id, text) VALUES (2, '{secret}');
+                 INSERT INTO clips(id, normalized_text) VALUES (2, '{secret}');
                  DELETE FROM clips;
                  PRAGMA wal_checkpoint(TRUNCATE);"
             ))
@@ -273,6 +314,48 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    #[test]
+    fn version_three_database_gains_maintenance_state_and_counts_fts_churn() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys=ON;
+                 CREATE TABLE clips (id INTEGER PRIMARY KEY, normalized_text TEXT);
+                 INSERT INTO clips(id, normalized_text) VALUES (1, 'counted'), (2, NULL);
+                 PRAGMA user_version=3;",
+            )
+            .unwrap();
+        migrate(&mut connection).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        // Migrating an existing database must not invent churn that was never
+        // paid into the FTS index.
+        assert_eq!(deleted_since_fts_optimize(&connection), 0);
+
+        // Replacing text leaves a tombstone behind, so an update costs the index
+        // as much as a delete does.
+        connection
+            .execute_batch("UPDATE clips SET normalized_text = 'replaced' WHERE id = 1;")
+            .unwrap();
+        assert_eq!(deleted_since_fts_optimize(&connection), 1);
+
+        // Only rows that carried text were ever indexed, so the NULL row is free.
+        connection.execute_batch("DELETE FROM clips;").unwrap();
+        assert_eq!(deleted_since_fts_optimize(&connection), 2);
+    }
+
+    fn deleted_since_fts_optimize(connection: &Connection) -> i64 {
+        connection
+            .query_row(
+                "SELECT deleted_since_fts_optimize FROM maintenance_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn file_contains(path: &std::path::Path, needle: &[u8]) -> bool {

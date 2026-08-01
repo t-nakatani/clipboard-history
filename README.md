@@ -27,6 +27,7 @@
 - 100,000件のtransactional retention
 - 16KiBを超えるpayloadのcontent-addressed file保存
 - tombstone queueによる遅延GCと孤児payload回収
+- 45秒周期のPeriodic/Idle/DeepIdle background maintenance（WAL checkpoint、bounded vacuum、条件付きFTS5 optimize）
 - unclean shutdown時だけ行うbackground recoveryと破損store隔離
 - Swift専用serial queueからRust store actorを呼ぶ非同期境界
 - 1クリックで開く半透明のAppKit panel
@@ -37,7 +38,7 @@
 
 - UIは50件単位の双方向keyset pagingを使い、summaryは最大200件だけを保持
 - 複数Pasteboard itemは先頭itemだけを保存
-- ディスク容量上限、pin、定期checkpoint/vacuumはアプリ経路へ未接続
+- ディスク容量上限とpinは未実装。checkpoint/vacuum/条件付きFTS optimizeはidle maintenanceとして接続済みだが、capture/search p95の実負荷測定は未完了
 - global shortcutと設定画面は未実装
 - Xcode project、code signing、notarizationは未整備
 
@@ -174,7 +175,7 @@ clipboard-history/
 詳細なチェックリストと完了条件は[TODO.md](TODO.md)で管理します。
 
 1. 復元時の自己再captureを抑止する
-2. idle maintenanceを接続する
+2. idle maintenanceがcapture/searchのp95を悪化させないことを測定する
 3. 画像込み100,000件でアプリ全体のRSSと描画時間を測定する
 4. global shortcut、エラー表示、設定画面を追加する
 5. ディスク容量retention、pin、配布工程を整備する

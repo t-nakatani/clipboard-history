@@ -56,6 +56,29 @@ pub struct GarbageCollectionStatsDto {
     pub staged_files_deleted: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct CheckpointResultDto {
+    pub busy: u64,
+    pub log_frames: u64,
+    pub checkpointed_frames: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum MaintenanceTriggerDto {
+    Periodic,
+    Idle,
+    DeepIdle,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MaintenanceReportDto {
+    pub garbage_collection: GarbageCollectionStatsDto,
+    pub passive_checkpoint: Option<CheckpointResultDto>,
+    pub truncate_checkpoint: Option<CheckpointResultDto>,
+    pub vacuum_pages: u64,
+    pub fts_optimized: bool,
+}
+
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct StartupRecoveryDto {
     pub was_unclean: bool,
@@ -137,6 +160,17 @@ impl ClipboardEngine {
             .recover_orphans()
             .map_err(store_error)
             .map(garbage_collection_stats_dto)
+    }
+
+    pub fn run_maintenance(
+        &self,
+        trigger: MaintenanceTriggerDto,
+    ) -> Result<MaintenanceReportDto, ClipboardFfiError> {
+        self.service
+            .repository()
+            .run_maintenance(maintenance_trigger(trigger))
+            .map_err(store_error)
+            .map(maintenance_report_dto)
     }
 
     pub fn shutdown(&self) -> Result<(), ClipboardFfiError> {
@@ -348,6 +382,32 @@ fn garbage_collection_stats_dto(
     }
 }
 
+fn maintenance_trigger(trigger: MaintenanceTriggerDto) -> clipboard_store::MaintenanceTrigger {
+    match trigger {
+        MaintenanceTriggerDto::Periodic => clipboard_store::MaintenanceTrigger::Periodic,
+        MaintenanceTriggerDto::Idle => clipboard_store::MaintenanceTrigger::Idle,
+        MaintenanceTriggerDto::DeepIdle => clipboard_store::MaintenanceTrigger::DeepIdle,
+    }
+}
+
+fn checkpoint_result_dto(result: clipboard_store::CheckpointResult) -> CheckpointResultDto {
+    CheckpointResultDto {
+        busy: result.busy,
+        log_frames: result.log_frames,
+        checkpointed_frames: result.checkpointed_frames,
+    }
+}
+
+fn maintenance_report_dto(report: clipboard_store::MaintenanceReport) -> MaintenanceReportDto {
+    MaintenanceReportDto {
+        garbage_collection: garbage_collection_stats_dto(report.garbage_collection),
+        passive_checkpoint: report.passive_checkpoint.map(checkpoint_result_dto),
+        truncate_checkpoint: report.truncate_checkpoint.map(checkpoint_result_dto),
+        vacuum_pages: report.vacuum_pages,
+        fts_optimized: report.fts_optimized,
+    }
+}
+
 fn store_error(error: clipboard_store::StoreError) -> ClipboardFfiError {
     ClipboardFfiError::Store {
         message: error.to_string(),
@@ -529,6 +589,10 @@ mod tests {
             .search("persisted".into(), SearchModeDto::Prefix, 50)
             .unwrap();
         assert_eq!(searched.len(), 1);
+        let maintenance = engine
+            .run_maintenance(MaintenanceTriggerDto::Periodic)
+            .unwrap();
+        assert!(!maintenance.fts_optimized);
         assert!(engine.delete(rows[0].id).unwrap());
         assert!(engine.recent(50).unwrap().is_empty());
 

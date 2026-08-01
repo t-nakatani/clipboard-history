@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var statusItem: NSStatusItem?
     private var monitor: PasteboardMonitor?
     private var storeClient: HistoryStoreClient?
+    private let maintenanceScheduler = StorageMaintenanceScheduler()
     private var panel: HistoryPanel?
     private var pageWindow = HistoryPageWindow(maximumCount: 200)
     private var historyRows: [ClipSummaryDto] { pageWindow.rows }
@@ -58,6 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     func applicationWillTerminate(_ notification: Notification) {
         searchTimer?.invalidate()
+        maintenanceScheduler.stop()
         monitor?.stop()
         do {
             try storeClient?.shutdown()
@@ -85,6 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc private func restoreSelected() {
         let row = tableView.selectedRow
         guard historyRows.indices.contains(row), let storeClient else { return }
+        markStoreActivity()
         let summary = historyRows[row]
         statusLabel.stringValue = "復元中…"
         storeClient.select(id: summary.id) { [weak self] result in
@@ -103,6 +106,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc private func deleteSelected() {
         let row = tableView.selectedRow
         guard historyRows.indices.contains(row), let storeClient else { return }
+        markStoreActivity()
         let id = historyRows[row].id
         storeClient.delete(id: id) { [weak self] result in
             switch result {
@@ -123,6 +127,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func startMonitoring(storeClient: HistoryStoreClient) {
         self.storeClient = storeClient
+        maintenanceScheduler.start { [weak self] trigger, finished in
+            guard let storeClient = self?.storeClient else {
+                finished()
+                return
+            }
+            storeClient.runMaintenance(trigger: trigger) { result in
+                if case let .failure(error) = result {
+                    NSLog("Clipboard History maintenance failed: %@", error.localizedDescription)
+                }
+                finished()
+            }
+        }
         monitor = PasteboardMonitor(
             onCapture: { [weak self] candidate in self?.persist(candidate: candidate) },
             onRejection: { [weak self] decision in self?.show(rejection: decision) }
@@ -172,6 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func togglePanel() {
         guard let panel, let button = statusItem?.button else { return }
+        markStoreActivity()
         panel.toggle(relativeTo: button, firstResponder: searchField)
         if panel.isVisible {
             NSApplication.shared.activate(ignoringOtherApps: true)
@@ -283,6 +300,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func persist(candidate: CapturedClipboardCandidate) {
+        markStoreActivity()
         statusLabel.stringValue = "保存中…"
         let shortIdentity = String(candidate.identity.prefix(12))
         detailLabel.stringValue = "\(candidate.representationTypes.joined(separator: ", "))\n\(candidate.payloadBytes) bytes · hash \(shortIdentity)…"
@@ -334,6 +352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func reloadHistory() {
+        markStoreActivity()
         if !searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             performSearch()
             return
@@ -364,6 +383,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func scheduleSearch() {
+        // Typing is activity even though the request is still debounced. Waiting
+        // for performSearch would leave a window in which the scheduler still
+        // believes the app is deep idle and can put an FTS optimize on the store
+        // queue that the imminent search then has to wait behind.
+        markStoreActivity()
         searchTimer?.invalidate()
         searchTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: false) { [weak self] _ in
             self?.performSearch()
@@ -372,6 +396,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func performSearch() {
         guard let storeClient else { return }
+        markStoreActivity()
         searchTimer?.invalidate()
         searchTimer = nil
         searchGeneration += 1
@@ -440,6 +465,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func historyBoundsDidChange() {
+        markStoreActivity()
         let visibleRows = tableView.rows(in: tableView.visibleRect)
         guard visibleRows.location != NSNotFound else { return }
         if visibleRows.location <= 10, pageWindow.hasMoreNewer {
@@ -451,6 +477,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func loadPage(_ direction: PageDirectionDto) {
         guard !isLoadingPage, let storeClient else { return }
+        markStoreActivity()
         let cursor: HistoryCursorDto?
         switch direction {
         case .older:
@@ -499,6 +526,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if pageWindow.hasMoreNewer { return true }
         let visibleRows = tableView.rows(in: tableView.visibleRect)
         return visibleRows.location != NSNotFound && visibleRows.location > 10
+    }
+
+    private func markStoreActivity() {
+        maintenanceScheduler.markActivity()
     }
 
     private func visibleAnchor() -> (id: Int64, offset: CGFloat)? {

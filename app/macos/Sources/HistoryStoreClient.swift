@@ -36,6 +36,16 @@ final class HistoryStoreClient {
         }
     }
 
+    func runMaintenance(
+        trigger: MaintenanceTriggerDto,
+        completion: @escaping Completion<MaintenanceReportDto>
+    ) {
+        queue.async { [engine] in
+            let result = Result { try engine.runMaintenance(trigger: trigger) }
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
     func shutdown() throws {
         try queue.sync { try engine.shutdown() }
     }

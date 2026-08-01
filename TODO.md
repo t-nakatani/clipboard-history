@@ -1,6 +1,6 @@
 # TODO
 
-最終更新: 2026-08-01
+最終更新: 2026-08-02
 
 このファイルは、Clipboard Historyを技術PoCから日常利用可能なmacOSアプリへ進めるための残タスクを管理します。
 
@@ -37,12 +37,14 @@
 
 ### ストレージmaintenance
 
-- [ ] 定期的なpassive WAL checkpointを接続する
+- [x] 定期的なpassive WAL checkpointを接続する
 - [x] clean shutdown時にtruncate checkpointを実行する
-- [ ] idle時にtruncate checkpointを実行する
-- [ ] idle時のincremental vacuumを接続する
-- [ ] 条件付きでFTS5 optimizeを実行する
+- [x] idle時にtruncate checkpointを実行する
+- [x] idle時のincremental vacuumを接続する
+- [x] 条件付きでFTS5 optimizeを実行する
 - [ ] maintenanceがcapture/searchのp95を悪化させないことを測る
+
+実装: Rust store actorが`Periodic`・`Idle`・`DeepIdle`を閾値判定し、GC、WAL checkpoint、bounded incremental vacuum、削除量に応じたFTS5 optimizeを実行する。macOS側はcapture/searchの活動を基準に45秒周期でbackground maintenanceを投入する。
 
 ### retentionとpin
 
