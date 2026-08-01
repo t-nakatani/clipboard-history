@@ -25,11 +25,13 @@
 
 ### アプリ統合ベンチマーク
 
-- [ ] 100,000件DBでmenu clickから初回描画までを測る
-- [ ] 連続scroll時のRSSとpage取得latencyを測る
-- [ ] textのみ、画像混在、巨大payload混在を別scenarioにする
-- [ ] Swift、UniFFI、decoded image cacheを含むRSSを記録する
-- [ ] 結果と受け入れ基準を`docs/experiments/`へ残す
+- [x] 100,000件DBでmenu clickから初回描画までを測る
+- [x] 連続scroll時のRSSとpage取得latencyを測る
+- [x] textのみ、画像混在、巨大payload混在を別scenarioにする
+- [x] Swift、UniFFI、decoded image cacheを含むRSSを記録する
+- [x] 結果と受け入れ基準を`docs/experiments/`へ残す
+
+測定結果: [PoC 0006](docs/experiments/0006-app-integration-benchmark-results.md)
 
 完了条件: 「100,000件を低メモリで閲覧できる」をアプリ全体で再現可能に証明する。
 

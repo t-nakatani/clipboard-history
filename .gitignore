@@ -1,6 +1,7 @@
 /target/
 /app/macos/Generated/
 /app/macos/build/
+/experiments/app-integration-benchmark/build/
 /experiments/clipboard-history-poc/results/*.sqlite
 /experiments/results/image-preview-*/
 /.rust-review-results/

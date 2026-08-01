@@ -195,7 +195,7 @@ final class HistoryPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
-    func toggle(relativeTo statusButton: NSStatusBarButton, firstResponder: NSResponder?) {
+    func toggle(relativeTo statusButton: NSButton, firstResponder: NSResponder?) {
         if isVisible {
             dismiss()
         } else {
@@ -203,7 +203,7 @@ final class HistoryPanel: NSPanel {
         }
     }
 
-    func present(relativeTo statusButton: NSStatusBarButton, firstResponder: NSResponder?) {
+    func present(relativeTo statusButton: NSButton, firstResponder: NSResponder?) {
         position(relativeTo: statusButton)
         makeKeyAndOrderFront(nil)
         if let firstResponder {
@@ -227,7 +227,7 @@ final class HistoryPanel: NSPanel {
         dismiss()
     }
 
-    private func position(relativeTo statusButton: NSStatusBarButton) {
+    private func position(relativeTo statusButton: NSButton) {
         guard let buttonWindow = statusButton.window else {
             center()
             return
