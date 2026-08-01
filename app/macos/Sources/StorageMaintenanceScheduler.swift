@@ -24,6 +24,9 @@ final class StorageMaintenanceScheduler {
     private var lastActivity = Date()
     private var requestInFlight = false
     private var handler: Handler?
+    /// Incremented by every `start`/`stop` so the completion of a request issued
+    /// before a restart cannot clear the in-flight flag of the current one.
+    private var generation = 0
 
     init(configuration: Configuration = .standard) {
         self.configuration = configuration
@@ -39,6 +42,9 @@ final class StorageMaintenanceScheduler {
         ) { [weak self] _ in
             self?.tick()
         }
+        // Background upkeep has no deadline, so let macOS coalesce this timer
+        // with others instead of waking the CPU on its own.
+        timer.tolerance = configuration.periodicInterval / 4
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
@@ -48,6 +54,7 @@ final class StorageMaintenanceScheduler {
         timer = nil
         handler = nil
         requestInFlight = false
+        generation &+= 1
     }
 
     func markActivity() {
@@ -67,8 +74,10 @@ final class StorageMaintenanceScheduler {
         }
 
         requestInFlight = true
+        let issued = generation
         handler(trigger) { [weak self] in
-            self?.requestInFlight = false
+            guard let self, self.generation == issued else { return }
+            self.requestInFlight = false
         }
     }
 }

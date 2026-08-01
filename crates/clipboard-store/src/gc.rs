@@ -1,5 +1,3 @@
-use std::fs;
-
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::{PayloadHash, PayloadStore, StoreError, payload::PayloadEntry};
@@ -21,11 +19,11 @@ pub(crate) fn collect_orphans(
     let mut stats = GarbageCollectionStats::default();
     payload_store.visit_entries(|entry| {
         match entry {
-            PayloadEntry::Staged(path) => match fs::remove_file(path) {
-                Ok(()) => stats.staged_files_deleted += 1,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            },
+            PayloadEntry::Staged(path) => {
+                if payload_store.remove_staged(&path)? {
+                    stats.staged_files_deleted += 1;
+                }
+            }
             PayloadEntry::Payload(hash) => {
                 let known = connection
                     .query_row(

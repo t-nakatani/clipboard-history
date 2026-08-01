@@ -134,7 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             }
             storeClient.runMaintenance(trigger: trigger) { result in
                 if case let .failure(error) = result {
-                    NSLog("Clipboard History maintenance failed: \(error.localizedDescription)")
+                    NSLog("Clipboard History maintenance failed: %@", error.localizedDescription)
                 }
                 finished()
             }

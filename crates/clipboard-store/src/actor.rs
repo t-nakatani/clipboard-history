@@ -624,27 +624,36 @@ fn run_maintenance(
         report.fts_optimized = true;
     }
 
-    let stats_before_vacuum = store_stats(connection, database_path)?;
+    let mut stats = store_stats(connection, database_path)?;
     if !matches!(trigger, MaintenanceTrigger::Periodic)
-        && stats_before_vacuum.freelist_count >= policy.vacuum_freelist_pages
+        && stats.freelist_count >= policy.vacuum_freelist_pages
     {
         connection.execute_batch(&format!(
             "PRAGMA incremental_vacuum({})",
             policy.vacuum_step_pages
         ))?;
-        let stats_after_vacuum = store_stats(connection, database_path)?;
-        report.vacuum_pages = stats_before_vacuum
+        // The vacuum itself appends WAL frames, so the checkpoint decision below
+        // has to see the state left behind by it rather than the earlier reading.
+        let after_vacuum = store_stats(connection, database_path)?;
+        report.vacuum_pages = stats
             .freelist_count
-            .saturating_sub(stats_after_vacuum.freelist_count);
+            .saturating_sub(after_vacuum.freelist_count);
+        stats = after_vacuum;
     }
 
-    let stats = store_stats(connection, database_path)?;
+    // A PASSIVE checkpoint moves frames back into the database but never shrinks
+    // the WAL file, so once the file passes the gate it stays past it until a
+    // TRUNCATE runs. Re-running is cheap because SQLite returns immediately when
+    // no frame is pending, and the report records only the runs that moved one.
     if stats.wal_bytes >= policy.truncate_checkpoint_wal_bytes
         && !matches!(trigger, MaintenanceTrigger::Periodic)
     {
         report.truncate_checkpoint = Some(checkpoint(connection, "TRUNCATE")?);
     } else if stats.wal_bytes >= policy.passive_checkpoint_wal_bytes {
-        report.passive_checkpoint = Some(checkpoint(connection, "PASSIVE")?);
+        let passive = checkpoint(connection, "PASSIVE")?;
+        if passive.checkpointed_frames > 0 {
+            report.passive_checkpoint = Some(passive);
+        }
     }
     Ok(report)
 }
@@ -815,6 +824,104 @@ mod tests {
         assert_eq!(stats.payload_files_deleted, 1);
         drop(service);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleted_clip_content_is_not_recoverable_from_the_database_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-secure-delete-test-{unique}"));
+        let database_path = root.join("history.sqlite");
+        let options = StoreOptions::new(&database_path, root.join("payloads"));
+        let service = HistoryService::new(
+            StoreHandle::open(options).unwrap(),
+            SearchTextPolicy::default(),
+        );
+        // The FTS5 trigram tokenizer indexes three-character tokens, so scanning
+        // only for the whole secret would miss index residue entirely. The secret
+        // embeds letter runs whose trigrams ("zqx", "qxj", "xjv", "jvw") are rare
+        // enough that a stray match in a small SQLite file is implausible.
+        let secret = format!("secret-passphrase-zqxjvw-{unique}-do-not-linger");
+        let secret_trigrams = ["zqx", "qxj", "xjv", "jvw"];
+        let preview_marker: Vec<u8> = format!("preview-marker-{unique}").into_bytes();
+        let external_marker: Vec<u8> = format!("external-marker-{unique}")
+            .into_bytes()
+            .repeat(2048);
+
+        let outcome = service
+            .capture(
+                ClipboardSnapshot {
+                    representations: vec![
+                        Representation {
+                            uti: "public.utf8-plain-text".into(),
+                            bytes: secret.as_bytes().to_vec(),
+                        },
+                        Representation {
+                            uti: "public.data".into(),
+                            bytes: external_marker.clone(),
+                        },
+                    ],
+                    image_preview: Some(ImagePreview {
+                        uti: "public.png".into(),
+                        bytes: preview_marker.clone(),
+                    }),
+                },
+                ClipKind::Mixed,
+                1,
+            )
+            .unwrap();
+        let clipboard_core::CaptureOutcome::Stored(stored) = outcome else {
+            panic!("expected stored clip")
+        };
+        service.repository().checkpoint_truncate().unwrap();
+        assert!(
+            file_contains(&database_path, secret.as_bytes()),
+            "the test is only meaningful if the clip really reached the file"
+        );
+        for trigram in secret_trigrams {
+            assert!(
+                file_contains(&database_path, trigram.as_bytes()),
+                "expected the trigram index to hold {trigram} before the delete"
+            );
+        }
+
+        assert!(service.repository().delete(stored.id).unwrap());
+        service.repository().collect_garbage(100).unwrap();
+        service.repository().checkpoint_truncate().unwrap();
+        service.repository().incremental_vacuum(4096).unwrap();
+        service.repository().checkpoint_truncate().unwrap();
+
+        // secure_delete zeroes the freed cells and the FTS5 secure-delete option
+        // rewrites the segment blobs, so neither the row text, the trigram tokens
+        // nor the preview blob may remain in the live file or WAL.
+        let mut needles: Vec<&[u8]> = vec![secret.as_bytes(), preview_marker.as_slice()];
+        needles.extend(secret_trigrams.iter().map(|trigram| trigram.as_bytes()));
+        for path in [
+            database_path.clone(),
+            PathBuf::from(format!("{}-wal", database_path.display())),
+        ] {
+            for needle in &needles {
+                assert!(
+                    !file_contains(&path, needle),
+                    "{} still contains deleted clip content {:?}",
+                    path.display(),
+                    String::from_utf8_lossy(needle)
+                );
+            }
+        }
+        assert!(!file_contains(&database_path, &external_marker[..64]));
+
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn file_contains(path: &std::path::Path, needle: &[u8]) -> bool {
+        let Ok(bytes) = std::fs::read(path) else {
+            return false;
+        };
+        bytes.windows(needle.len()).any(|window| window == needle)
     }
 
     #[test]
