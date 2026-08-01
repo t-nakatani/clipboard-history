@@ -41,7 +41,9 @@ pub struct HistoryCursorDto {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct HistoryPageDto {
     pub items: Vec<ClipSummaryDto>,
+    pub continuation_cursor: Option<HistoryCursorDto>,
     pub has_more: bool,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
@@ -270,7 +272,12 @@ fn page_direction(direction: PageDirectionDto) -> clipboard_core::PageDirection 
 fn history_page_dto(page: clipboard_core::HistoryPage) -> HistoryPageDto {
     HistoryPageDto {
         items: page.items.into_iter().map(clip_summary_dto).collect(),
+        continuation_cursor: page.continuation_cursor.map(|cursor| HistoryCursorDto {
+            last_used_at_ms: cursor.last_used_at_ms,
+            id: cursor.id.0,
+        }),
         has_more: page.has_more,
+        truncated: page.truncated,
     }
 }
 
@@ -454,21 +461,14 @@ mod tests {
             .unwrap();
         assert_eq!(first.items.len(), 2);
         assert!(first.has_more);
+        assert!(!first.truncated);
         let second = engine
-            .recent_page(
-                first.items.last().map(dto_cursor),
-                PageDirectionDto::Older,
-                2,
-            )
+            .recent_page(first.continuation_cursor, PageDirectionDto::Older, 2)
             .unwrap();
         assert_eq!(second.items.len(), 2);
         assert!(second.has_more);
         let final_page = engine
-            .recent_page(
-                second.items.last().map(dto_cursor),
-                PageDirectionDto::Older,
-                2,
-            )
+            .recent_page(second.continuation_cursor, PageDirectionDto::Older, 2)
             .unwrap();
         assert_eq!(final_page.items.len(), 1);
         assert!(!final_page.has_more);

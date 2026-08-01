@@ -37,7 +37,17 @@ func runBindingSelfTest() -> Int32 {
                 hasImagePreview: false
             )
         }
-        let page = HistoryPageDto(items: items, hasMore: pageIndex < 4)
+        let page = HistoryPageDto(
+            items: items,
+            continuationCursor: pageIndex < 4
+                ? HistoryCursorDto(
+                    lastUsedAtMs: Int64(1_000 - (start + 49)),
+                    id: Int64(start + 49)
+                )
+                : nil,
+            hasMore: pageIndex < 4,
+            truncated: false
+        )
         if pageIndex == 0 {
             pageWindow.reset(with: page)
         } else {
@@ -67,7 +77,14 @@ func runBindingSelfTest() -> Int32 {
             hasImagePreview: false
         )
     }
-    pageWindow.prependNewer(HistoryPageDto(items: newestItems, hasMore: false))
+    pageWindow.prependNewer(
+        HistoryPageDto(
+            items: newestItems,
+            continuationCursor: nil,
+            hasMore: false,
+            truncated: false
+        )
+    )
     guard
         pageWindow.rows.count == 200,
         pageWindow.rows.first?.id == 0,
@@ -76,6 +93,49 @@ func runBindingSelfTest() -> Int32 {
         pageWindow.hasMoreOlder
     else {
         fputs("bounded history page window could not return to newer pages\n", stderr)
+        return 1
+    }
+
+    let recopied = ClipSummaryDto(
+        id: 150,
+        kind: "text",
+        lastUsedAtMs: 2_000,
+        pinned: false,
+        copyCount: 2,
+        payloadSize: 1,
+        preview: "item-150",
+        hasImagePreview: false
+    )
+    pageWindow.prependNewer(
+        HistoryPageDto(
+            items: [recopied],
+            continuationCursor: nil,
+            hasMore: false,
+            truncated: false
+        )
+    )
+    guard
+        pageWindow.rows.count == 200,
+        pageWindow.rows.first?.id == 150,
+        pageWindow.rows.first?.copyCount == 2,
+        pageWindow.rows.filter({ $0.id == 150 }).count == 1
+    else {
+        fputs("recopied row was not moved to its new position\n", stderr)
+        return 1
+    }
+
+    var scanWindow = HistoryPageWindow(maximumCount: 200)
+    let scanCursor = HistoryCursorDto(lastUsedAtMs: 500, id: 500)
+    scanWindow.reset(
+        with: HistoryPageDto(
+            items: [],
+            continuationCursor: scanCursor,
+            hasMore: true,
+            truncated: true
+        )
+    )
+    guard scanWindow.hasMoreOlder, scanWindow.olderAnchor == scanCursor else {
+        fputs("truncated empty scan lost its continuation cursor\n", stderr)
         return 1
     }
 

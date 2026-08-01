@@ -271,13 +271,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 let count = capture.recentPage.items.count
                 self?.detailLabel.stringValue = "clip #\(capture.result.id) · 最近\(count)件をメモリ保持"
                 if self?.searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
-                    self?.searchGeneration += 1
-                    self?.activeSearchQuery = nil
-                    self?.isLoadingPage = false
                     if self?.panel?.isVisible == true, self?.isViewingAwayFromNewest == true {
+                        // Keep the generation so an in-flight edge page can still land.
                         self?.pageWindow.markNewerAvailable()
                         self?.statusLabel.stringValue = "新しい履歴あり"
                     } else {
+                        self?.searchGeneration += 1
+                        self?.activeSearchQuery = nil
+                        self?.isLoadingPage = false
                         self?.apply(page: capture.recentPage, reset: true)
                     }
                 } else {
@@ -373,6 +374,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 self.apply(page: page, reset: true)
                 self.statusLabel.stringValue = "検索結果 \(page.items.count)件"
                 self.detailLabel.stringValue = "完全一致・前方一致・正確な部分一致のみ"
+                if page.truncated {
+                    DispatchQueue.main.async { self.loadPage(.older) }
+                }
             case let .failure(error):
                 self.show(error: error)
             }
@@ -439,6 +443,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             switch result {
             case let .success(page):
                 self.apply(page: page, reset: false, direction: direction)
+                if page.truncated {
+                    DispatchQueue.main.async { self.loadPage(direction) }
+                }
             case let .failure(error):
                 self.show(error: error)
             }

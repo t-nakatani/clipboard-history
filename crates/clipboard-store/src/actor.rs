@@ -909,7 +909,7 @@ mod tests {
                     3,
                 )
                 .unwrap();
-            let next_cursor = page.items.last().map(cursor_for);
+            let next_cursor = page.continuation_cursor;
             results.extend(page.items);
             if !page.has_more {
                 break;
@@ -937,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_recent_scan_can_continue_past_the_first_two_thousand_rows() {
+    fn bounded_recent_scan_continues_across_a_sparse_empty_window() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -952,12 +952,17 @@ mod tests {
             SearchTextPolicy::default(),
         );
         for index in 0..2_105 {
+            let value = if index == 2_104 {
+                "x-target".to_owned()
+            } else {
+                format!("row-{index}")
+            };
             service
                 .capture(
                     ClipboardSnapshot {
                         representations: vec![Representation {
                             uti: "public.utf8-plain-text".into(),
-                            bytes: format!("x-{index}").into_bytes(),
+                            bytes: value.into_bytes(),
                         }],
                         image_preview: None,
                     },
@@ -969,6 +974,7 @@ mod tests {
 
         let mut cursor = None;
         let mut count = 0;
+        let mut saw_empty_truncated_page = false;
         loop {
             let page = service
                 .search_page(
@@ -979,13 +985,17 @@ mod tests {
                     50,
                 )
                 .unwrap();
-            cursor = page.items.last().map(cursor_for);
+            if page.items.is_empty() && page.truncated {
+                saw_empty_truncated_page = true;
+            }
+            cursor = page.continuation_cursor;
             count += page.items.len();
             if !page.has_more {
                 break;
             }
         }
-        assert_eq!(count, 2_105);
+        assert!(saw_empty_truncated_page);
+        assert_eq!(count, 1);
 
         drop(service);
         std::fs::remove_dir_all(root).unwrap();

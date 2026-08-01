@@ -102,7 +102,12 @@ pub enum PageDirection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HistoryPage {
     pub items: Vec<ClipSummary>,
+    /// Seek position for the next request in the same direction. This can be
+    /// beyond the last matching item when a bounded recent scan is truncated.
+    pub continuation_cursor: Option<HistoryCursor>,
     pub has_more: bool,
+    /// The bounded scan reached its row budget before proving end-of-history.
+    pub truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

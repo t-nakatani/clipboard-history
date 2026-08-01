@@ -28,7 +28,7 @@ elapsed_ms=34.781
 
 Swift側は最大200 summaryの`HistoryPageWindow`を使い、5 page目の追加時に最も新しい50件を解放すること、そこから新しいpageをprependして元の方向へ戻れることをセルフテストしている。画像bytesはsummary pageに含まれず、従来どおり表示対象だけを別APIで読む。
 
-production testでは、同一timestampと途中のcapture/deleteを含む3 pageを古い方向へ進んだ後、新しい方向へ2 page戻して同じ行列が得られることを検証した。`EXPLAIN QUERY PLAN`では`< / DESC`と`> / ASC`の両方が`idx_clips_recent`を利用する。また、短い部分一致検索を2,105件通して、2000行のrecent scan境界を越えて継続できることを確認した。
+production testでは、同一timestampと途中のcapture/deleteを含む3 pageを古い方向へ進んだ後、新しい方向へ2 page戻して同じ行列が得られることを検証した。`EXPLAIN QUERY PLAN`では`< / DESC`と`> / ASC`の両方が`idx_clips_recent`を利用する。また、新しい2,000件がすべて不一致で最古側の1件だけが一致する2,105件の短い部分一致検索を使い、空のscan windowが`truncated + continuation_cursor`を返して次のwindowへ継続できることを確認した。
 
 ## 再現方法
 

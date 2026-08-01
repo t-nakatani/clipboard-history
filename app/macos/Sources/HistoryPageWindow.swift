@@ -6,6 +6,8 @@ struct HistoryPageWindow {
     private(set) var rows: [ClipSummaryDto] = []
     private(set) var hasMoreOlder = false
     private(set) var hasMoreNewer = false
+    private var olderContinuation: HistoryCursorDto?
+    private var newerContinuation: HistoryCursorDto?
     let maximumCount: Int
 
     init(maximumCount: Int) {
@@ -13,13 +15,15 @@ struct HistoryPageWindow {
         self.maximumCount = maximumCount
     }
 
-    var olderAnchor: HistoryCursorDto? { rows.last.map(Self.cursor) }
-    var newerAnchor: HistoryCursorDto? { rows.first.map(Self.cursor) }
+    var olderAnchor: HistoryCursorDto? { olderContinuation ?? rows.last.map(Self.cursor) }
+    var newerAnchor: HistoryCursorDto? { newerContinuation ?? rows.first.map(Self.cursor) }
 
     mutating func reset(with page: HistoryPageDto) {
         rows = Array(page.items.prefix(maximumCount))
         hasMoreOlder = page.hasMore || page.items.count > maximumCount
         hasMoreNewer = false
+        olderContinuation = page.continuationCursor
+        newerContinuation = nil
     }
 
     mutating func appendOlder(_ page: HistoryPageDto) {
@@ -28,24 +32,31 @@ struct HistoryPageWindow {
         if rows.count > maximumCount {
             rows.removeFirst(rows.count - maximumCount)
             hasMoreNewer = true
+            newerContinuation = rows.first.map(Self.cursor)
         }
         hasMoreOlder = page.hasMore
+        olderContinuation = page.continuationCursor
     }
 
     mutating func prependNewer(_ page: HistoryPageDto) {
-        var known = Set(rows.map(\.id))
-        let additions = page.items.filter { known.insert($0.id).inserted }
-        rows.insert(contentsOf: additions, at: 0)
+        // A recopy keeps its clip ID but receives a newer timestamp. Remove
+        // the stale occurrence before inserting the returned row at its new position.
+        let incomingIds = Set(page.items.map(\.id))
+        rows.removeAll { incomingIds.contains($0.id) }
+        rows.insert(contentsOf: page.items, at: 0)
         if rows.count > maximumCount {
             rows.removeLast(rows.count - maximumCount)
             hasMoreOlder = true
+            olderContinuation = rows.last.map(Self.cursor)
         }
         hasMoreNewer = page.hasMore
+        newerContinuation = page.continuationCursor
     }
 
     mutating func markNewerAvailable() {
         if !rows.isEmpty {
             hasMoreNewer = true
+            newerContinuation = rows.first.map(Self.cursor)
         }
     }
 

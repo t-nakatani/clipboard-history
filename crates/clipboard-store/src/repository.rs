@@ -338,6 +338,21 @@ pub(crate) fn search_page(
                     ":limit": fetch_limit,
                 },
             )?;
+            if items.len() > limit {
+                return Ok(history_page(items, limit, page.reverse));
+            }
+            if let Some(continuation_cursor) = recent_scan_boundary(connection, page)? {
+                let mut items = items;
+                if page.reverse {
+                    items.reverse();
+                }
+                return Ok(HistoryPage {
+                    items,
+                    continuation_cursor: Some(continuation_cursor),
+                    has_more: true,
+                    truncated: true,
+                });
+            }
             Ok(history_page(items, limit, page.reverse))
         }
         PlannedQuery::Indexed {
@@ -383,6 +398,8 @@ fn search_prefix_page(
 ) -> Result<HistoryPage, StoreError> {
     let pattern = like_pattern(MatchMode::Prefix, needle);
     let fetch_limit = (limit + 1) as i64;
+    // rusqlite requires every named parameter to exist in both SQL variants.
+    // The NULL guard keeps `:key` present when the expression index uses LIKE.
     let (prefix_clause, key) = if needle.chars().count() <= 64 {
         (
             ":key IS NULL AND substr(c.normalized_text, 1, 64) LIKE :pattern ESCAPE '\\'",
@@ -475,7 +492,55 @@ fn history_page(mut items: Vec<ClipSummary>, limit: usize, reverse: bool) -> His
     if reverse {
         items.reverse();
     }
-    HistoryPage { items, has_more }
+    let continuation_cursor = has_more.then(|| {
+        let item = if reverse {
+            items.first().expect("a non-empty page with continuation")
+        } else {
+            items.last().expect("a non-empty page with continuation")
+        };
+        HistoryCursor {
+            last_used_at_ms: item.last_used_at_ms,
+            id: item.id,
+        }
+    });
+    HistoryPage {
+        items,
+        continuation_cursor,
+        has_more,
+        truncated: false,
+    }
+}
+
+fn recent_scan_boundary(
+    connection: &Connection,
+    page: PageSql,
+) -> Result<Option<HistoryCursor>, StoreError> {
+    let sql = format!(
+        "SELECT clips.last_used_at, clips.id
+         FROM clips
+         WHERE clips.normalized_text IS NOT NULL AND {}
+         ORDER BY clips.last_used_at {}, clips.id {}
+         LIMIT 1 OFFSET 1999",
+        page.predicate("clips"),
+        page.order,
+        page.order
+    );
+    connection
+        .query_row(
+            &sql,
+            named_params! {
+                ":anchor_time": page.anchor.last_used_at_ms,
+                ":anchor_id": page.anchor.id.0,
+            },
+            |row| {
+                Ok(HistoryCursor {
+                    last_used_at_ms: row.get(0)?,
+                    id: ClipId(row.get(1)?),
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn query_summaries<P: rusqlite::Params>(
