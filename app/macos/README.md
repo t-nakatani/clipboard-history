@@ -7,6 +7,8 @@ captureは必ず2段階で行います。
 1. `NSPasteboardItem.types`からtype identifierだけを集め、payloadを読む前にRustの`CaptureFilter`へ渡す。
 2. acceptされた場合だけ、保存対象のUTIをwhitelistし、そのbytesを読み取ってUniFFI DTOへ変換する。
 
+判定はすべてのitemが広告する型一覧を対象にしたfail-safe ORで、marker一致はASCII case-insensitiveです。concealedとtransientが同時に現れた場合はconcealedを理由として返します。復元側の`PasteboardWriter`も同じ`CaptureFilter`で再確認します。
+
 concealed/transient markerは保存representationにもcanonical identityにも入りません。現在は複数itemのうち先頭だけを保存候補にします。複数itemのidentityモデルは別途決定します。
 
 SQLiteとpayloadは`~/Library/Application Support/ClipboardHistory/`へ保存します。Swiftの`HistoryStoreClient`が専用serial queueから同期UniFFI APIを呼ぶため、AppKit main threadはSQLiteやfilesystem I/Oを待ちません。履歴は50件単位で読み、Swiftが保持するsummaryは最大200件です。
