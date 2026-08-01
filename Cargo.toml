@@ -4,6 +4,7 @@ members = [
     "crates/clipboard-store",
     "crates/clipboard-ffi",
 ]
+exclude = ["experiments/clipboard-history-poc"]
 resolver = "3"
 
 [workspace.package]
