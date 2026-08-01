@@ -408,6 +408,26 @@ pub fn evaluate_capture_types(pasteboard_types: Vec<String>) -> CaptureFilterDec
     }
 }
 
+/// The marker lists behind `evaluate_capture_types`, so Swift can exercise the policy without
+/// keeping its own copy of the identifiers.
+#[uniffi::export]
+pub fn concealed_marker_types() -> Vec<String> {
+    CaptureFilter
+        .concealed_markers()
+        .iter()
+        .map(|marker| (*marker).to_owned())
+        .collect()
+}
+
+#[uniffi::export]
+pub fn transient_marker_types() -> Vec<String> {
+    CaptureFilter
+        .transient_markers()
+        .iter()
+        .map(|marker| (*marker).to_owned())
+        .collect()
+}
+
 #[uniffi::export]
 pub fn canonical_hash(representations: Vec<RepresentationDto>) -> String {
     let representations: Vec<Representation> =
@@ -445,6 +465,24 @@ mod tests {
             ]),
             CaptureFilterDecisionDto::RejectConcealed
         );
+    }
+
+    #[test]
+    fn ffi_exposes_every_marker_the_filter_rejects() {
+        for marker in concealed_marker_types() {
+            assert_eq!(
+                evaluate_capture_types(vec![marker.clone()]),
+                CaptureFilterDecisionDto::RejectConcealed,
+                "{marker} was exposed as concealed but not rejected"
+            );
+        }
+        for marker in transient_marker_types() {
+            assert_eq!(
+                evaluate_capture_types(vec![marker.clone()]),
+                CaptureFilterDecisionDto::RejectTransient,
+                "{marker} was exposed as transient but not rejected"
+            );
+        }
     }
 
     #[test]

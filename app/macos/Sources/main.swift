@@ -15,6 +15,47 @@ func runBindingSelfTest() -> Int32 {
         return 1
     }
 
+    // The marker lists come from crates/clipboard-core/src/filter.rs through UniFFI, so this
+    // check cannot drift out of sync when a marker is added. Matching is case-insensitive and
+    // evaluated across every advertised type.
+    let concealedMarkers = concealedMarkerTypes()
+    let transientMarkers = transientMarkerTypes()
+    guard !concealedMarkers.isEmpty, !transientMarkers.isEmpty else {
+        fputs("core exposed no capture markers\n", stderr)
+        return 1
+    }
+    for marker in concealedMarkers {
+        guard evaluateCaptureTypes(pasteboardTypes: ["public.html", marker.uppercased()]) == .rejectConcealed else {
+            fputs("concealed marker \(marker) was not rejected in a mixed type list\n", stderr)
+            return 1
+        }
+    }
+    for marker in transientMarkers {
+        guard evaluateCaptureTypes(pasteboardTypes: ["public.utf8-plain-text", marker.uppercased()]) == .rejectTransient else {
+            fputs("transient marker \(marker) was not rejected in a mixed type list\n", stderr)
+            return 1
+        }
+    }
+
+    // Restore stays defensive even if a marker somehow reached storage.
+    do {
+        let markerRepresentation = RepresentationDto(
+            uti: "org.nspasteboard.ConcealedType",
+            bytes: Data("secret".utf8)
+        )
+        try PasteboardWriter.restore(
+            representations: [markerRepresentation],
+            pasteboard: NSPasteboard(name: .init("clipboard-history-self-test-\(UUID().uuidString)"))
+        )
+        fputs("restore wrote a marker representation back to the pasteboard\n", stderr)
+        return 1
+    } catch PasteboardRestoreError.noWritableRepresentation {
+        // Expected: the only representation was a marker and was skipped.
+    } catch {
+        fputs("restore failed for an unexpected reason: \(error)\n", stderr)
+        return 1
+    }
+
     let text = RepresentationDto(uti: "public.utf8-plain-text", bytes: Data("hello".utf8))
     let html = RepresentationDto(uti: "public.html", bytes: Data("<b>hello</b>".utf8))
     guard canonicalHash(representations: [text, html]) == canonicalHash(representations: [html, text]) else {
