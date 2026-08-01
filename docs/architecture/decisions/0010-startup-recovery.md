@@ -12,10 +12,11 @@ Accepted
 
 ## Decision
 
-- Rust storeはDBと同じ場所の`history.sqlite.running`を単独所有する。open時に原子的に作成し、clean shutdownのtruncate checkpoint完了後に削除する。
+- Rust storeはDBと同じ場所の`history.sqlite.running`を単独所有する。open時に原子的に作成し、clean shutdownのtruncate checkpoint完了後に削除する。ただしrecoveryが未完了のまま終了する場合はmarkerを残し、次回起動で再試行する。
 - open時にmarkerが残っていれば`startup_recovery_required`をUniFFIへ公開する。通常起動では`quick_check`を実行しない。
 - Swiftはrecentの初回requestを先にserial queueへ積み、その後で`recover_startup`を実行する。panelはscan完了を待たず、読み込み済みsummaryを表示する。
 - startup recoveryは`quick_check`、queued payload GC、streaming orphan scanの順で実行する。markerがなければこの処理をskipする。
+- recoveryが失敗しても、接続が使える限りactorは動き続けてcapture・searchを受け付ける。接続を張り替える再構築pathの失敗だけがactorを停止させる。
 - `quick_check`失敗、またはunclean open時にSQLiteが`CORRUPT`/`NOTADB`を返した場合は、接続を閉じてDB、WAL、SHM、payload directoryを同じtimestamp suffixで隔離し、新しい空storeを作る。
 - 隔離データは自動削除しない。UIには隔離DBのpathを表示する。
 - `recover_orphans`は診断・手動maintenance用にもUniFFIへ公開する。
@@ -25,4 +26,5 @@ Accepted
 - clean startupの同期pathから`quick_check`とdirectory scanが外れる。
 - unclean startupでも最初のrecent pageを先に表示できる。recovery中に要求された追加のstore操作はserial queueで待機する。
 - 破損時は履歴を空から再開するが、旧DBとpayloadを一組で保持するため手動回復の可能性を残せる。
+- orphan scanが一時的なI/Oエラーで失敗しても、そのsessionのcaptureや検索は継続でき、markerが残るため回収機会も失われない。
 - markerはsingle-instance applicationを前提とする。同じstoreを複数processから同時に開く用途にはfile lockを別途導入する必要がある。

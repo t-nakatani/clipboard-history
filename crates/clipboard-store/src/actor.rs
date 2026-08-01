@@ -450,7 +450,7 @@ fn run_actor(
                     &mut connection,
                     &mut payload_store,
                     &options,
-                    initial_quarantine.take(),
+                    &mut initial_quarantine,
                 ) {
                     Ok((report, rebuilt_live_count)) => {
                         if let Some(count) = rebuilt_live_count {
@@ -459,16 +459,26 @@ fn run_actor(
                         recovery_pending = false;
                         let _ = reply.send(Ok(report));
                     }
-                    Err(error) => {
-                        let _ = reply.send(Err(error));
-                        break;
+                    Err(failure) => {
+                        // recovery_pending stays true so the marker survives shutdown and the
+                        // next open retries.
+                        let _ = reply.send(Err(failure.error));
+                        if !failure.connection_usable {
+                            break;
+                        }
                     }
                 }
             }
             Command::Shutdown(reply) => {
                 let result = checkpoint(&connection, "TRUNCATE")
                     .map(|_| ())
-                    .and_then(|()| remove_running_marker(&marker_path));
+                    .and_then(|()| {
+                        if recovery_pending {
+                            Ok(())
+                        } else {
+                            remove_running_marker(&marker_path)
+                        }
+                    });
                 let _ = reply.send(result);
                 break;
             }
@@ -497,30 +507,56 @@ fn quick_check(connection: &Connection) -> Result<(), StoreError> {
         })
 }
 
+/// A failed recovery attempt. `connection_usable` is false only when the store connection was
+/// left unusable, which is the sole reason to stop the actor instead of serving later commands.
+struct RecoveryFailure {
+    error: StoreError,
+    connection_usable: bool,
+}
+
+impl RecoveryFailure {
+    const fn retryable(error: StoreError) -> Self {
+        Self {
+            error,
+            connection_usable: true,
+        }
+    }
+
+    const fn fatal(error: StoreError) -> Self {
+        Self {
+            error,
+            connection_usable: false,
+        }
+    }
+}
+
 fn perform_startup_recovery(
     connection: &mut Connection,
     payload_store: &mut PayloadStore,
     options: &StoreOptions,
-    initial_quarantine: Option<PathBuf>,
-) -> Result<(StartupRecoveryReport, Option<usize>), StoreError> {
-    if let Some(quarantine_path) = initial_quarantine {
-        quick_check(connection)?;
-        let garbage_collection = collect_startup_garbage(connection, payload_store)?;
+    initial_quarantine: &mut Option<PathBuf>,
+) -> Result<(StartupRecoveryReport, Option<usize>), RecoveryFailure> {
+    if initial_quarantine.is_some() {
+        quick_check(connection).map_err(RecoveryFailure::fatal)?;
+        let garbage_collection = collect_startup_garbage(connection, payload_store)
+            .map_err(RecoveryFailure::retryable)?;
+        let live_count = repository::count(connection).map_err(RecoveryFailure::retryable)?;
         return Ok((
             StartupRecoveryReport {
                 was_unclean: true,
                 quick_check_passed: false,
                 database_rebuilt: true,
-                quarantine_path: Some(quarantine_path),
+                quarantine_path: initial_quarantine.take(),
                 garbage_collection,
             },
-            Some(repository::count(connection)?),
+            Some(live_count),
         ));
     }
 
     match quick_check(connection) {
         Ok(()) => {
-            let garbage_collection = collect_startup_garbage(connection, payload_store)?;
+            let garbage_collection = collect_startup_garbage(connection, payload_store)
+                .map_err(RecoveryFailure::retryable)?;
             Ok((
                 StartupRecoveryReport {
                     was_unclean: true,
@@ -533,14 +569,18 @@ fn perform_startup_recovery(
             ))
         }
         Err(_) => {
-            let placeholder = Connection::open_in_memory()?;
+            // From here the live connection is replaced, so any failure leaves the actor without
+            // a usable store.
+            let placeholder = Connection::open_in_memory()
+                .map_err(|error| RecoveryFailure::fatal(StoreError::from(error)))?;
             let broken = std::mem::replace(connection, placeholder);
             drop(broken);
-            let quarantine_path = quarantine_store(options)?;
-            let (new_connection, new_payload_store) = open_store(options)?;
+            let quarantine_path = quarantine_store(options).map_err(RecoveryFailure::fatal)?;
+            let (new_connection, new_payload_store) =
+                open_store(options).map_err(RecoveryFailure::fatal)?;
             *connection = new_connection;
             *payload_store = new_payload_store;
-            quick_check(connection)?;
+            quick_check(connection).map_err(RecoveryFailure::fatal)?;
             Ok((
                 StartupRecoveryReport {
                     was_unclean: true,
@@ -1377,6 +1417,62 @@ mod tests {
         );
 
         drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_startup_recovery_keeps_store_usable_and_retries_next_open() {
+        let root = unique_test_root("clipboard-recovery-failure-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let options = StoreOptions::new(root.join("history.sqlite"), root.join("payloads"));
+        // A regular file where the payload directory belongs makes the orphan scan fail.
+        std::fs::write(&options.payload_directory, b"not a directory").unwrap();
+        std::fs::write(
+            running_marker_path(&options.database_path),
+            b"stale marker\n",
+        )
+        .unwrap();
+
+        let store = StoreHandle::open(options.clone()).unwrap();
+        assert!(store.startup_recovery_required());
+        assert!(store.recover_startup().is_err());
+        assert!(store.recent(10).unwrap().is_empty());
+        assert!(store.stats().is_ok());
+        store.shutdown().unwrap();
+        assert!(running_marker_path(&options.database_path).exists());
+        drop(store);
+
+        std::fs::remove_file(&options.payload_directory).unwrap();
+        let retried = StoreHandle::open(options.clone()).unwrap();
+        assert!(retried.startup_recovery_required());
+        assert!(retried.recover_startup().unwrap().was_unclean);
+        retried.shutdown().unwrap();
+        assert!(!running_marker_path(&options.database_path).exists());
+        drop(retried);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_before_recovery_keeps_marker_for_next_open() {
+        let root = unique_test_root("clipboard-recovery-deferred-test");
+        let options = StoreOptions::new(root.join("history.sqlite"), root.join("payloads"));
+        drop(StoreHandle::open(options.clone()).unwrap());
+        std::fs::write(
+            running_marker_path(&options.database_path),
+            b"stale marker\n",
+        )
+        .unwrap();
+
+        let store = StoreHandle::open(options.clone()).unwrap();
+        assert!(store.startup_recovery_required());
+        store.shutdown().unwrap();
+        assert!(running_marker_path(&options.database_path).exists());
+        drop(store);
+
+        let reopened = StoreHandle::open(options.clone()).unwrap();
+        assert!(reopened.startup_recovery_required());
+        drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
     }
 
