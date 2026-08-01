@@ -112,7 +112,28 @@ impl PayloadStore {
     }
 
     pub fn remove_if_exists(&self, hash: PayloadHash) -> Result<bool, StoreError> {
-        match fs::remove_file(self.path_for(hash)) {
+        let path = self.path_for(hash);
+        // Overwrite the payload before unlinking so the plaintext is gone from the
+        // file the moment the last reference disappears, instead of lingering in
+        // whatever blocks the filesystem later hands out. This is best effort: on
+        // copy-on-write filesystems such as APFS the write may land on new blocks
+        // and leave the originals readable until they are reused, and existing
+        // snapshots, Time Machine backups and iCloud copies keep their own data.
+        // Overwrite failures must not block deletion, so they are ignored; a path
+        // that is not a regular file is simply unlinked as before.
+        let _ = zero_file(&path);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Removes a staged temporary payload, overwriting it first with the same
+    /// best-effort guarantees as [`PayloadStore::remove_if_exists`].
+    pub(crate) fn remove_staged(&self, path: &Path) -> Result<bool, StoreError> {
+        let _ = zero_file(path);
+        match fs::remove_file(path) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error.into()),
@@ -179,9 +200,10 @@ fn parse_hash(value: &str) -> Option<PayloadHash> {
 }
 
 /// Opens a payload file without following a symlink at the final component.
-fn open_payload_file(path: &Path) -> Result<File, StoreError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
+///
+/// The caller supplies the access mode so that both the read path and the
+/// delete-time overwrite share these protections.
+fn open_payload_file(path: &Path, options: &mut OpenOptions) -> Result<File, StoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -210,7 +232,7 @@ fn open_payload_file(path: &Path) -> Result<File, StoreError> {
 /// Opens a payload file and rejects it unless it is a regular file no larger
 /// than `max_bytes`. Returns the opened file and its size.
 fn open_validated(path: &Path, max_bytes: u64) -> Result<(File, u64), StoreError> {
-    let file = open_payload_file(path)?;
+    let file = open_payload_file(path, OpenOptions::new().read(true))?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(StoreError::InvalidData(
@@ -297,6 +319,32 @@ fn verify_file(path: &Path, hash: PayloadHash, expected_size: u64) -> Result<boo
         Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+/// Overwrites the payload at `path` with zeros.
+///
+/// Uses the same no-follow open as the read path, so a payload path swapped
+/// for a symlink can never redirect the overwrite onto another file, and only
+/// regular files are written to.
+fn zero_file(path: &Path) -> Result<(), StoreError> {
+    const CHUNK: usize = 64 * 1024;
+    let mut file = open_payload_file(path, OpenOptions::new().write(true))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(StoreError::InvalidData(
+            "payload path is not a regular file",
+        ));
+    }
+    let mut remaining = metadata.len();
+    let zeros = [0_u8; CHUNK];
+    while remaining > 0 {
+        let take = remaining.min(CHUNK as u64) as usize;
+        file.write_all(&zeros[..take])?;
+        remaining -= take as u64;
+    }
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<(), StoreError> {
@@ -443,6 +491,47 @@ mod tests {
         assert!(!fs::symlink_metadata(&again.path).unwrap().is_symlink());
         assert_eq!(fs::read(&target).unwrap(), b"attacker");
         assert_eq!(store.read(stored.hash, LIMIT).unwrap(), b"payload");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remove_overwrites_payload_before_unlinking() {
+        let root = temp_root("wipe");
+        let store = PayloadStore::new(&root);
+        let secret = b"correct horse battery staple";
+        let stored = store.put(secret).unwrap();
+        // A second link to the same inode observes what was written to the file
+        // itself, which the unlink alone would leave untouched.
+        let witness = root.join("witness");
+        fs::hard_link(&stored.path, &witness).unwrap();
+
+        assert!(store.remove_if_exists(stored.hash).unwrap());
+
+        assert!(!stored.path.exists());
+        assert_eq!(fs::read(&witness).unwrap(), vec![0_u8; secret.len()]);
+        assert!(!store.remove_if_exists(stored.hash).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_does_not_overwrite_through_a_symlink() {
+        let root = temp_root("remove-symlink");
+        let store = PayloadStore::new(&root);
+        let hash = PayloadHash::of(b"anything");
+        let payload_path = store.path_for(hash);
+        fs::create_dir_all(payload_path.parent().unwrap()).unwrap();
+
+        // An attacker replaces the payload path with a link to an unrelated file.
+        let outsider = root.join("outsider");
+        fs::write(&outsider, b"untouchable").unwrap();
+        std::os::unix::fs::symlink(&outsider, &payload_path).unwrap();
+
+        assert!(store.remove_if_exists(hash).unwrap());
+
+        // The link is gone, but the file it pointed at keeps its contents.
+        assert!(!payload_path.exists());
+        assert_eq!(fs::read(&outsider).unwrap(), b"untouchable");
         fs::remove_dir_all(root).unwrap();
     }
 }

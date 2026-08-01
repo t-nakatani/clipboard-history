@@ -43,6 +43,25 @@ Accepted for experimentation
 
 保持制限は件数と論理payload容量の両方に適用し、pinned rowを保護する。pruningは100 rowずつのtransactionへ分割し、interactive writeのtail latencyを抑える。削除pageはfreelistへ戻るだけなので、新規DBでは`auto_vacuum=INCREMENTAL`を有効化し、低優先度で`incremental_vacuum`を実行する。大量prune後はFTS5の`optimize`が必要だが約0.5秒かかるため、idle maintenanceとして稀に実行する。full `VACUUM`は採用しない。
 
+## Secure deletion
+
+履歴にはpasswordやtokenが含まれうるため、削除は論理削除で終わらせない。全connectionで`PRAGMA secure_delete=ON`を設定し、`clips`、`representations`、`clip_previews`の解放cellをSQLiteに零クリアさせる。secure_deleteはconnection単位の設定なので、`configure_connection`で書き込み前に必ず適用する。
+
+FTS5索引は`PRAGMA secure_delete`の対象外である。segmentは追記専用で、削除はtombstoneを足すだけであり、元のtrigramは`clips_fts_data`に残る。そのためFTS5自身の`secure-delete`optionを有効化し、削除時に該当segmentを書き直させる。この設定は`clips_fts_config`に保存されるためconnectionを跨いで永続する。
+
+secure_delete導入前に作られたDBはfree pageに平文を残し、FTS5 segmentには削除済みclipのtrigramが残っている。schema version 3への一度きりのmigrationでこれを解消する。順序が重要で、まずFTS5の`secure-delete` optionを設定して`rebuild`で索引を作り直し、古いsegmentとtombstoneを解放してから、full `VACUUM`とWAL truncateでそのpageをファイルから追い出す。`rebuild`を省くとVACUUMは生きているshadow table rowを写すだけで、古いtrigramが新しいファイルへそのままコピーされる。定常運用でfull VACUUMを採用しない方針は変えず、この経路だけを例外とする。`user_version`のbumpが再実行を防ぐ。
+
+外部payloadは`unlink`前にファイル本体を零で上書きする。GC対象のstaged一時ファイルも同じ経路を通す。上書きは`O_NOFOLLOW`でopenし、regular fileであることを確認してから行う。payload pathがsymlinkへ差し替えられていてもリンク先を破壊せず、確認に失敗した場合は上書きを諦めてunlinkだけを行う（削除自体はblockしない）。
+
+残存リスクは以下のとおりで、storeでは解消できない。
+
+- APFSはcopy-on-writeであり、上書きが元blockではなく新blockへ着地しうる。旧blockは再利用されるまで読める可能性がある。
+- 既存のAPFS snapshot、Time Machine、iCloudなどのbackupは削除前のコピーを保持し続ける。
+- secure_deleteが零クリアするのはDB pageであり、checkpointされるまでの間はWALに削除前のpage imageが残りうる。idleとclean shutdownでのtruncate checkpointが実質的な上限を決める。
+- SSDのwear levelingとTRIM挙動により、物理媒体上の残留は制御できない。
+
+これらを前提に、より強い保証が必要な場合はfilesystem levelの暗号化（FileVault）に依存する。
+
 ## Migration and recovery
 
 - schema versionは`PRAGMA user_version`で管理する。
