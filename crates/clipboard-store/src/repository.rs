@@ -279,7 +279,7 @@ pub(crate) fn representations(
                 let hash: [u8; 32] = raw_hash
                     .try_into()
                     .map_err(|_| StoreError::InvalidData("invalid payload hash length"))?;
-                payload_store.read(crate::PayloadHash(hash))?
+                payload_store.read(crate::PayloadHash(hash), max_restore_bytes as u64)?
             }
             _ => {
                 return Err(StoreError::InvalidData(
