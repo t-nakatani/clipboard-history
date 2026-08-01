@@ -167,4 +167,4 @@
   - [x] clean/unclean shutdown markerとUniFFI recovery API
   - [x] unclean時だけbackgroundでquick check、queued GC、orphan scanを実行
   - [x] recovery前にrecentを読み、panel表示をscan完了で待たせない
-  - [x] 破損DB・WAL/SHM・payloadを隔離して空storeを再構築
+  - [x] 破損DB・WAL/SHM・payloadをdurable manifestで隔離・再開して空storeを再構築
