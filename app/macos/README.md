@@ -9,9 +9,11 @@ captureは必ず2段階で行います。
 
 concealed/transient markerは保存representationにもcanonical identityにも入りません。現在は複数itemのうち先頭だけを保存候補にします。複数itemのidentityモデルは別途決定します。
 
-SQLiteとpayloadは`~/Library/Application Support/ClipboardHistory/`へ保存します。Swiftの`HistoryStoreClient`が専用serial queueから同期UniFFI APIを呼ぶため、AppKit main threadはSQLiteやfilesystem I/Oを待ちません。Swiftが保持するrecent結果は最大50件です。
+SQLiteとpayloadは`~/Library/Application Support/ClipboardHistory/`へ保存します。Swiftの`HistoryStoreClient`が専用serial queueから同期UniFFI APIを呼ぶため、AppKit main threadはSQLiteやfilesystem I/Oを待ちません。履歴は50件単位で読み、Swiftが保持するsummaryは最大200件です。
 
-検索欄は完全一致、前方一致、正確な部分一致の3 modeだけを持ちます。入力は120ms debounceされ、古いgenerationの結果はUIへ反映しません。3文字未満の完全一致・部分一致は最新2,000件に限定したscanへ落とし、履歴全体を走査しません。
+Rust storeは起動中markerを所有し、clean shutdown時にtruncate checkpointを終えてからmarkerを削除します。前回markerが残っていた場合だけ、recentの初回表示後にbackgroundで`quick_check`、queued GC、orphan scanを実行します。破損を検出した場合はDB、WAL/SHM、payload directoryをtimestamp付きで隔離して空storeを再構築します。
+
+検索欄は完全一致、前方一致、正確な部分一致の3 modeだけを持ちます。入力は120ms debounceされ、古いgenerationの結果はUIへ反映しません。3文字未満の完全一致・部分一致は1 requestあたり2,000件に制限したscanへ落とし、`truncated` cursorで必要な場合だけ次の窓へ進みます。
 
 画像はcapture時にImageIOで最大96pxのJPEG previewをstore用serial queue上で生成します。previewは原representation、canonical identity、復元payloadから独立しており、最大64KiBです。一覧summaryにはpreview bytesを入れず、表示対象だけを専用APIで非同期取得します。decoded image cacheは最大64件・概算4MiBに制限されます。
 

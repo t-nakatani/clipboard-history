@@ -59,6 +59,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     func applicationWillTerminate(_ notification: Notification) {
         searchTimer?.invalidate()
         monitor?.stop()
+        do {
+            try storeClient?.shutdown()
+        } catch {
+            NSLog("Clipboard History clean shutdown failed: \(error.localizedDescription)")
+        }
     }
 
     @objc private func performStatusItemClick() {
@@ -125,6 +130,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         monitor?.start()
         statusLabel.stringValue = "コピー待機中"
         reloadHistory()
+        if storeClient.startupRecoveryRequired {
+            statusLabel.stringValue = "前回の終了状態を検証中…"
+            storeClient.recoverStartup { [weak self] result in
+                switch result {
+                case let .success(report):
+                    if report.databaseRebuilt {
+                        self?.statusLabel.stringValue = "破損した履歴を隔離して再構築"
+                        self?.detailLabel.stringValue = report.quarantinePath ?? "隔離先を確認できません"
+                        self?.reloadHistory()
+                    } else {
+                        let removed = report.garbageCollection.payloadFilesDeleted
+                            + report.garbageCollection.orphanFilesDeleted
+                            + report.garbageCollection.stagedFilesDeleted
+                        self?.statusLabel.stringValue = "起動時リカバリー完了"
+                        self?.detailLabel.stringValue = "孤児payload \(removed)件を回収"
+                    }
+                case let .failure(error):
+                    self?.show(error: error)
+                }
+            }
+        }
     }
 
     private func configureStatusItem() {

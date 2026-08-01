@@ -10,6 +10,7 @@ final class HistoryStoreClient {
 
     private let engine: ClipboardEngine
     private let queue = DispatchQueue(label: "dev.clipboard-history.store", qos: .userInitiated)
+    let startupRecoveryRequired: Bool
 
     init(fileManager: FileManager = .default) throws {
         let applicationSupport = try fileManager.url(
@@ -25,6 +26,18 @@ final class HistoryStoreClient {
             databasePath: root.appendingPathComponent("history.sqlite").path,
             payloadDirectory: payloads.path
         )
+        startupRecoveryRequired = engine.startupRecoveryRequired()
+    }
+
+    func recoverStartup(completion: @escaping Completion<StartupRecoveryDto>) {
+        queue.async { [engine] in
+            let result = Result { try engine.recoverStartup() }
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    func shutdown() throws {
+        try queue.sync { try engine.shutdown() }
     }
 
     func capture(

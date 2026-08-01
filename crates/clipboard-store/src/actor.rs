@@ -1,7 +1,10 @@
 use std::{
-    path::PathBuf,
+    fs::{self, File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, Sender},
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use clipboard_core::{
@@ -53,6 +56,15 @@ pub struct CheckpointResult {
     pub checkpointed_frames: u64,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StartupRecoveryReport {
+    pub was_unclean: bool,
+    pub quick_check_passed: bool,
+    pub database_rebuilt: bool,
+    pub quarantine_path: Option<PathBuf>,
+    pub garbage_collection: GarbageCollectionStats,
+}
+
 enum Command {
     Upsert(ClipCandidate, Sender<Result<UpsertOutcome, StoreError>>),
     RecentPage(
@@ -78,12 +90,14 @@ enum Command {
     Delete(ClipId, Sender<Result<bool, StoreError>>),
     CollectGarbage(usize, Sender<Result<GarbageCollectionStats, StoreError>>),
     RecoverOrphans(Sender<Result<GarbageCollectionStats, StoreError>>),
-    Shutdown,
+    RecoverStartup(Sender<Result<StartupRecoveryReport, StoreError>>),
+    Shutdown(Sender<Result<(), StoreError>>),
 }
 
 pub struct StoreHandle {
     sender: Sender<Command>,
     actor: Option<thread::JoinHandle<()>>,
+    startup_recovery_required: bool,
 }
 
 impl StoreHandle {
@@ -93,18 +107,60 @@ impl StoreHandle {
                 "retention limits must be greater than zero",
             ));
         }
+        if let Some(parent) = options.database_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let marker_path = running_marker_path(&options.database_path);
+        let startup_recovery_required = mark_store_running(&marker_path)?;
         let (sender, receiver) = mpsc::channel();
         let (ready_sender, ready_receiver) = mpsc::channel();
+        let marker_created_for_this_open = !startup_recovery_required;
+        let cleanup_marker_path = marker_path.clone();
         let actor = thread::Builder::new()
             .name("clipboard-store".into())
-            .spawn(move || run_actor(options, receiver, ready_sender))?;
-        ready_receiver
+            .spawn(move || {
+                run_actor(
+                    options,
+                    receiver,
+                    ready_sender,
+                    marker_path,
+                    startup_recovery_required,
+                    marker_created_for_this_open,
+                )
+            });
+        let actor = match actor {
+            Ok(actor) => actor,
+            Err(error) => {
+                if marker_created_for_this_open {
+                    let _ = fs::remove_file(cleanup_marker_path);
+                }
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = ready_receiver
             .recv()
-            .map_err(|_| StoreError::ActorStopped)??;
+            .map_err(|_| StoreError::ActorStopped)?
+        {
+            let _ = actor.join();
+            return Err(error);
+        }
         Ok(Self {
             sender,
             actor: Some(actor),
+            startup_recovery_required,
         })
+    }
+
+    pub const fn startup_recovery_required(&self) -> bool {
+        self.startup_recovery_required
+    }
+
+    pub fn recover_startup(&self) -> Result<StartupRecoveryReport, StoreError> {
+        self.request(Command::RecoverStartup)
+    }
+
+    pub fn shutdown(&self) -> Result<(), StoreError> {
+        self.request(Command::Shutdown)
     }
 
     pub fn quick_check(&self) -> Result<(), StoreError> {
@@ -224,7 +280,9 @@ impl HistoryRepository for StoreHandle {
 
 impl Drop for StoreHandle {
     fn drop(&mut self) {
-        let _ = self.sender.send(Command::Shutdown);
+        let (reply, receiver) = mpsc::channel();
+        let _ = self.sender.send(Command::Shutdown(reply));
+        let _ = receiver.recv();
         if let Some(actor) = self.actor.take() {
             let _ = actor.join();
         }
@@ -235,12 +293,28 @@ fn run_actor(
     options: StoreOptions,
     receiver: Receiver<Command>,
     ready: Sender<Result<(), StoreError>>,
+    marker_path: PathBuf,
+    startup_recovery_required: bool,
+    marker_created_for_this_open: bool,
 ) {
-    let result = open_store(&options);
-    let Ok((mut connection, payload_store)) = result else {
+    let mut initial_quarantine = None;
+    let result = open_store(&options).or_else(|error| {
+        if startup_recovery_required && is_corrupt_database_error(&error) {
+            let quarantine = quarantine_store(&options)?;
+            initial_quarantine = Some(quarantine);
+            open_store(&options)
+        } else {
+            Err(error)
+        }
+    });
+    let Ok((mut connection, mut payload_store)) = result else {
+        if marker_created_for_this_open {
+            let _ = fs::remove_file(&marker_path);
+        }
         let _ = ready.send(result.map(|_| ()));
         return;
     };
+    let mut recovery_pending = startup_recovery_required;
     let mut live_count = match repository::count(&connection) {
         Ok(count) => count,
         Err(error) => {
@@ -329,15 +403,7 @@ fn run_actor(
                 ));
             }
             Command::QuickCheck(reply) => {
-                let result = connection
-                    .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
-                    .map_err(StoreError::from)
-                    .and_then(|value| {
-                        (value == "ok")
-                            .then_some(())
-                            .ok_or(StoreError::InvalidData("quick_check failed"))
-                    });
-                let _ = reply.send(result);
+                let _ = reply.send(quick_check(&connection));
             }
             Command::Stats(reply) => {
                 let result = store_stats(&connection, &options.database_path);
@@ -375,7 +441,37 @@ fn run_actor(
                 let result = gc::collect_orphans(&connection, &payload_store);
                 let _ = reply.send(result);
             }
-            Command::Shutdown => break,
+            Command::RecoverStartup(reply) => {
+                if !recovery_pending {
+                    let _ = reply.send(Ok(StartupRecoveryReport::default()));
+                    continue;
+                }
+                match perform_startup_recovery(
+                    &mut connection,
+                    &mut payload_store,
+                    &options,
+                    initial_quarantine.take(),
+                ) {
+                    Ok((report, rebuilt_live_count)) => {
+                        if let Some(count) = rebuilt_live_count {
+                            live_count = count;
+                        }
+                        recovery_pending = false;
+                        let _ = reply.send(Ok(report));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        break;
+                    }
+                }
+            }
+            Command::Shutdown(reply) => {
+                let result = checkpoint(&connection, "TRUNCATE")
+                    .map(|_| ())
+                    .and_then(|()| remove_running_marker(&marker_path));
+                let _ = reply.send(result);
+                break;
+            }
         }
     }
 }
@@ -388,6 +484,190 @@ fn open_store(options: &StoreOptions) -> Result<(Connection, PayloadStore), Stor
     configure_connection(&connection, options.cache_kib)?;
     migrate(&mut connection)?;
     Ok((connection, PayloadStore::new(&options.payload_directory)))
+}
+
+fn quick_check(connection: &Connection) -> Result<(), StoreError> {
+    connection
+        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+        .map_err(StoreError::from)
+        .and_then(|value| {
+            (value == "ok")
+                .then_some(())
+                .ok_or(StoreError::InvalidData("quick_check failed"))
+        })
+}
+
+fn perform_startup_recovery(
+    connection: &mut Connection,
+    payload_store: &mut PayloadStore,
+    options: &StoreOptions,
+    initial_quarantine: Option<PathBuf>,
+) -> Result<(StartupRecoveryReport, Option<usize>), StoreError> {
+    if let Some(quarantine_path) = initial_quarantine {
+        quick_check(connection)?;
+        let garbage_collection = collect_startup_garbage(connection, payload_store)?;
+        return Ok((
+            StartupRecoveryReport {
+                was_unclean: true,
+                quick_check_passed: false,
+                database_rebuilt: true,
+                quarantine_path: Some(quarantine_path),
+                garbage_collection,
+            },
+            Some(repository::count(connection)?),
+        ));
+    }
+
+    match quick_check(connection) {
+        Ok(()) => {
+            let garbage_collection = collect_startup_garbage(connection, payload_store)?;
+            Ok((
+                StartupRecoveryReport {
+                    was_unclean: true,
+                    quick_check_passed: true,
+                    database_rebuilt: false,
+                    quarantine_path: None,
+                    garbage_collection,
+                },
+                None,
+            ))
+        }
+        Err(_) => {
+            let placeholder = Connection::open_in_memory()?;
+            let broken = std::mem::replace(connection, placeholder);
+            drop(broken);
+            let quarantine_path = quarantine_store(options)?;
+            let (new_connection, new_payload_store) = open_store(options)?;
+            *connection = new_connection;
+            *payload_store = new_payload_store;
+            quick_check(connection)?;
+            Ok((
+                StartupRecoveryReport {
+                    was_unclean: true,
+                    quick_check_passed: false,
+                    database_rebuilt: true,
+                    quarantine_path: Some(quarantine_path),
+                    garbage_collection: GarbageCollectionStats::default(),
+                },
+                Some(0),
+            ))
+        }
+    }
+}
+
+fn collect_startup_garbage(
+    connection: &mut Connection,
+    payload_store: &PayloadStore,
+) -> Result<GarbageCollectionStats, StoreError> {
+    let mut total = GarbageCollectionStats::default();
+    loop {
+        let batch = gc::collect_queued(connection, payload_store, 10_000)?;
+        add_gc_stats(&mut total, batch);
+        if batch.queued_scanned < 10_000 {
+            break;
+        }
+    }
+    add_gc_stats(&mut total, gc::collect_orphans(connection, payload_store)?);
+    Ok(total)
+}
+
+fn add_gc_stats(total: &mut GarbageCollectionStats, batch: GarbageCollectionStats) {
+    total.queued_scanned += batch.queued_scanned;
+    total.referenced_skipped += batch.referenced_skipped;
+    total.payload_files_deleted += batch.payload_files_deleted;
+    total.missing_payload_files += batch.missing_payload_files;
+    total.orphan_files_deleted += batch.orphan_files_deleted;
+    total.staged_files_deleted += batch.staged_files_deleted;
+}
+
+fn running_marker_path(database_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.running", database_path.display()))
+}
+
+/// Returns true when a marker from a previous process already existed.
+fn mark_store_running(marker_path: &Path) -> Result<bool, StoreError> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker_path)
+    {
+        Ok(mut file) => {
+            writeln!(file, "pid={}", std::process::id())?;
+            file.sync_all()?;
+            if let Some(parent) = marker_path.parent() {
+                sync_directory(parent)?;
+            }
+            Ok(false)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_running_marker(marker_path: &Path) -> Result<(), StoreError> {
+    match fs::remove_file(marker_path) {
+        Ok(()) => {
+            if let Some(parent) = marker_path.parent() {
+                sync_directory(parent)?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn quarantine_store(options: &StoreOptions) -> Result<PathBuf, StoreError> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let quarantine_path = PathBuf::from(format!(
+        "{}.corrupt-{timestamp}",
+        options.database_path.display()
+    ));
+    rename_if_exists(&options.database_path, &quarantine_path)?;
+    for suffix in ["-wal", "-shm"] {
+        rename_if_exists(
+            &PathBuf::from(format!("{}{suffix}", options.database_path.display())),
+            &PathBuf::from(format!("{}{suffix}", quarantine_path.display())),
+        )?;
+    }
+    if options.payload_directory.exists() {
+        let quarantined_payloads = PathBuf::from(format!(
+            "{}.corrupt-{timestamp}",
+            options.payload_directory.display()
+        ));
+        fs::rename(&options.payload_directory, quarantined_payloads)?;
+    }
+    if let Some(parent) = options.database_path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(quarantine_path)
+}
+
+fn rename_if_exists(source: &Path, destination: &Path) -> Result<(), StoreError> {
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn sync_directory(path: &Path) -> Result<(), StoreError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn is_corrupt_database_error(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::Database(rusqlite::Error::SqliteFailure(code, _))
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            )
+    )
 }
 
 fn store_stats(connection: &Connection, path: &std::path::Path) -> Result<StoreStats, StoreError> {
@@ -999,6 +1279,113 @@ mod tests {
 
         drop(service);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clean_shutdown_removes_marker_and_skips_next_recovery() {
+        let root = unique_test_root("clipboard-clean-shutdown-test");
+        let options = StoreOptions::new(root.join("history.sqlite"), root.join("payloads"));
+        let marker = running_marker_path(&options.database_path);
+
+        let store = StoreHandle::open(options.clone()).unwrap();
+        assert!(!store.startup_recovery_required());
+        assert!(marker.exists());
+        store.shutdown().unwrap();
+        assert!(!marker.exists());
+        drop(store);
+
+        let reopened = StoreHandle::open(options).unwrap();
+        assert!(!reopened.startup_recovery_required());
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unclean_marker_enables_recovery_without_blocking_recent_open() {
+        let root = unique_test_root("clipboard-unclean-recovery-test");
+        let options = StoreOptions::new(root.join("history.sqlite"), root.join("payloads"));
+        drop(StoreHandle::open(options.clone()).unwrap());
+
+        let orphan = PayloadStore::new(&options.payload_directory)
+            .put(b"unreferenced payload")
+            .unwrap();
+        std::fs::write(
+            running_marker_path(&options.database_path),
+            b"stale marker\n",
+        )
+        .unwrap();
+
+        let store = StoreHandle::open(options.clone()).unwrap();
+        assert!(store.startup_recovery_required());
+        assert!(store.recent(10).unwrap().is_empty());
+        let report = store.recover_startup().unwrap();
+        assert!(report.was_unclean);
+        assert!(report.quick_check_passed);
+        assert!(!report.database_rebuilt);
+        assert_eq!(report.garbage_collection.orphan_files_deleted, 1);
+        assert!(
+            !PayloadStore::new(&options.payload_directory)
+                .path_for(orphan.hash)
+                .exists()
+        );
+
+        drop(store);
+        assert!(!running_marker_path(&options.database_path).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_unclean_database_and_payloads_are_quarantined() {
+        let root = unique_test_root("clipboard-corrupt-recovery-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let options = StoreOptions::new(root.join("history.sqlite"), root.join("payloads"));
+        std::fs::write(&options.database_path, b"not a sqlite database").unwrap();
+        std::fs::create_dir_all(&options.payload_directory).unwrap();
+        std::fs::write(
+            options.payload_directory.join("keep-for-recovery"),
+            b"payload",
+        )
+        .unwrap();
+        std::fs::write(
+            running_marker_path(&options.database_path),
+            b"stale marker\n",
+        )
+        .unwrap();
+
+        let store = StoreHandle::open(options.clone()).unwrap();
+        assert!(store.startup_recovery_required());
+        assert!(store.recent(10).unwrap().is_empty());
+        let report = store.recover_startup().unwrap();
+        assert!(report.database_rebuilt);
+        assert!(!report.quick_check_passed);
+        assert!(
+            report
+                .quarantine_path
+                .as_ref()
+                .is_some_and(|path| path.exists())
+        );
+        assert!(
+            root.read_dir()
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("payloads.corrupt-")
+                })
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn unique_test_root(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{unique}"))
     }
 
     fn cursor_for(item: &clipboard_core::ClipSummary) -> HistoryCursor {

@@ -27,6 +27,7 @@
 - 100,000件のtransactional retention
 - 16KiBを超えるpayloadのcontent-addressed file保存
 - tombstone queueによる遅延GCと孤児payload回収
+- unclean shutdown時だけ行うbackground recoveryと破損store隔離
 - Swift専用serial queueからRust store actorを呼ぶ非同期境界
 - 1クリックで開く半透明のAppKit panel
 - text/image別のrow heightと画像thumbnail
@@ -166,13 +167,14 @@ clipboard-history/
 7. [画像preview pipeline](docs/architecture/decisions/0007-image-preview-pipeline.md)
 8. [履歴panelの表示密度](docs/architecture/decisions/0008-history-panel-density.md)
 9. [履歴のkeyset paging](docs/architecture/decisions/0009-keyset-paging.md)
+10. [起動時recovery](docs/architecture/decisions/0010-startup-recovery.md)
 
 ## 次の優先事項
 
 詳細なチェックリストと完了条件は[TODO.md](TODO.md)で管理します。
 
 1. 復元時の自己再captureを抑止する
-2. 起動時の孤児payload recoveryとidle maintenanceを接続する
+2. idle maintenanceを接続する
 3. 画像込み100,000件でアプリ全体のRSSと描画時間を測定する
 4. global shortcut、エラー表示、設定画面を追加する
 5. ディスク容量retention、pin、配布工程を整備する

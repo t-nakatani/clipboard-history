@@ -46,6 +46,25 @@ pub struct HistoryPageDto {
     pub truncated: bool,
 }
 
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct GarbageCollectionStatsDto {
+    pub queued_scanned: u64,
+    pub referenced_skipped: u64,
+    pub payload_files_deleted: u64,
+    pub missing_payload_files: u64,
+    pub orphan_files_deleted: u64,
+    pub staged_files_deleted: u64,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct StartupRecoveryDto {
+    pub was_unclean: bool,
+    pub quick_check_passed: bool,
+    pub database_rebuilt: bool,
+    pub quarantine_path: Option<String>,
+    pub garbage_collection: GarbageCollectionStatsDto,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum PageDirectionDto {
     Older,
@@ -95,10 +114,33 @@ impl ClipboardEngine {
         }
         let options = StoreOptions::new(database_path, payload_directory);
         let repository = StoreHandle::open(options).map_err(store_error)?;
-        repository.quick_check().map_err(store_error)?;
         Ok(Arc::new(Self {
             service: HistoryService::new(repository, SearchTextPolicy::default()),
         }))
+    }
+
+    pub fn startup_recovery_required(&self) -> bool {
+        self.service.repository().startup_recovery_required()
+    }
+
+    pub fn recover_startup(&self) -> Result<StartupRecoveryDto, ClipboardFfiError> {
+        self.service
+            .repository()
+            .recover_startup()
+            .map_err(store_error)
+            .map(startup_recovery_dto)
+    }
+
+    pub fn recover_orphans(&self) -> Result<GarbageCollectionStatsDto, ClipboardFfiError> {
+        self.service
+            .repository()
+            .recover_orphans()
+            .map_err(store_error)
+            .map(garbage_collection_stats_dto)
+    }
+
+    pub fn shutdown(&self) -> Result<(), ClipboardFfiError> {
+        self.service.repository().shutdown().map_err(store_error)
     }
 
     pub fn capture(
@@ -278,6 +320,31 @@ fn history_page_dto(page: clipboard_core::HistoryPage) -> HistoryPageDto {
         }),
         has_more: page.has_more,
         truncated: page.truncated,
+    }
+}
+
+fn startup_recovery_dto(report: clipboard_store::StartupRecoveryReport) -> StartupRecoveryDto {
+    StartupRecoveryDto {
+        was_unclean: report.was_unclean,
+        quick_check_passed: report.quick_check_passed,
+        database_rebuilt: report.database_rebuilt,
+        quarantine_path: report
+            .quarantine_path
+            .map(|path| path.to_string_lossy().into_owned()),
+        garbage_collection: garbage_collection_stats_dto(report.garbage_collection),
+    }
+}
+
+fn garbage_collection_stats_dto(
+    stats: clipboard_store::GarbageCollectionStats,
+) -> GarbageCollectionStatsDto {
+    GarbageCollectionStatsDto {
+        queued_scanned: stats.queued_scanned,
+        referenced_skipped: stats.referenced_skipped,
+        payload_files_deleted: stats.payload_files_deleted,
+        missing_payload_files: stats.missing_payload_files,
+        orphan_files_deleted: stats.orphan_files_deleted,
+        staged_files_deleted: stats.staged_files_deleted,
     }
 }
 
@@ -496,6 +563,43 @@ mod tests {
         assert!(search.has_more);
 
         drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ffi_exposes_conditional_startup_recovery_and_clean_shutdown() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-ffi-recovery-test-{unique}"));
+        let database = root.join("history.sqlite");
+        let payloads = root.join("payloads");
+        let engine = ClipboardEngine::open(
+            database.to_string_lossy().into_owned(),
+            payloads.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        assert!(!engine.startup_recovery_required());
+        engine.shutdown().unwrap();
+        drop(engine);
+
+        std::fs::write(format!("{}.running", database.display()), b"stale\n").unwrap();
+        let recovered = ClipboardEngine::open(
+            database.to_string_lossy().into_owned(),
+            payloads.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        assert!(recovered.startup_recovery_required());
+        let report = recovered.recover_startup().unwrap();
+        assert!(report.was_unclean);
+        assert!(report.quick_check_passed);
+        assert!(!report.database_rebuilt);
+        let manual = recovered.recover_orphans().unwrap();
+        assert_eq!(manual.orphan_files_deleted, 0);
+        recovered.shutdown().unwrap();
+        drop(recovered);
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
