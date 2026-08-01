@@ -1,0 +1,4 @@
+/target/
+/results/*.sqlite
+/results/*.sqlite-shm
+/results/*.sqlite-wal

@@ -1,0 +1,12 @@
+command=orphan-scan
+files_before=10000
+expected_orphans=1000
+create_ms=831.096
+scan_ms=279.986
+scan_files_per_second=35716.0
+orphan_files_deleted=1000
+staged_files_deleted=0
+files_after=9000
+rss_before_bytes=4079616
+rss_after_bytes=4456448
+rss_delta_bytes=376832

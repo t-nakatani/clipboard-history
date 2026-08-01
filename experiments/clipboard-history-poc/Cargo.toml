@@ -1,0 +1,13 @@
+[package]
+name = "clipboard-history-poc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+blake3 = "1.8.5"
+rusqlite = { version = "=0.39.0", features = ["bundled"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

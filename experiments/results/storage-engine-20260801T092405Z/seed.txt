@@ -1,0 +1,9 @@
+command=seed
+rows=100000
+elapsed_ms=7943.922
+rows_per_second=12588.2
+database_bytes=80699392
+page_size=4096
+page_count=19662
+freelist_count=209
+auto_vacuum=2

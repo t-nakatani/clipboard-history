@@ -1,0 +1,8 @@
+/target/
+/app/macos/Generated/
+/app/macos/build/
+/experiments/clipboard-history-poc/results/*.sqlite
+/.rust-review-results/
+.DS_Store
+*.sqlite-shm
+*.sqlite-wal

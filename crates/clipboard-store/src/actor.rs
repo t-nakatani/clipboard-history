@@ -1,0 +1,711 @@
+use std::{
+    path::PathBuf,
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
+};
+
+use clipboard_core::{
+    ClipCandidate, ClipId, ClipSummary, HistoryRepository, ImagePreview, PlannedQuery,
+    Representation, UpsertOutcome,
+};
+use rusqlite::Connection;
+
+use crate::{
+    GarbageCollectionStats, PayloadStore, StoreError, configure_connection, gc, migrate, repository,
+};
+
+#[derive(Clone, Debug)]
+pub struct StoreOptions {
+    pub database_path: PathBuf,
+    pub payload_directory: PathBuf,
+    pub cache_kib: usize,
+    pub inline_threshold: usize,
+    pub max_history_items: usize,
+    pub prune_batch_size: usize,
+    pub max_restore_bytes: usize,
+}
+
+impl StoreOptions {
+    pub fn new(database_path: impl Into<PathBuf>, payload_directory: impl Into<PathBuf>) -> Self {
+        Self {
+            database_path: database_path.into(),
+            payload_directory: payload_directory.into(),
+            cache_kib: 1024,
+            inline_threshold: 16 * 1024,
+            max_history_items: 100_000,
+            prune_batch_size: 1_000,
+            max_restore_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreStats {
+    pub page_count: u64,
+    pub freelist_count: u64,
+    pub wal_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointResult {
+    pub busy: u64,
+    pub log_frames: u64,
+    pub checkpointed_frames: u64,
+}
+
+enum Command {
+    Upsert(ClipCandidate, Sender<Result<UpsertOutcome, StoreError>>),
+    Recent(usize, Sender<Result<Vec<ClipSummary>, StoreError>>),
+    Representations(ClipId, Sender<Result<Vec<Representation>, StoreError>>),
+    ImagePreview(ClipId, Sender<Result<Option<ImagePreview>, StoreError>>),
+    Search(
+        PlannedQuery,
+        usize,
+        Sender<Result<Vec<ClipSummary>, StoreError>>,
+    ),
+    QuickCheck(Sender<Result<(), StoreError>>),
+    Stats(Sender<Result<StoreStats, StoreError>>),
+    CheckpointPassive(Sender<Result<CheckpointResult, StoreError>>),
+    CheckpointTruncate(Sender<Result<CheckpointResult, StoreError>>),
+    IncrementalVacuum(u64, Sender<Result<(), StoreError>>),
+    Delete(ClipId, Sender<Result<bool, StoreError>>),
+    CollectGarbage(usize, Sender<Result<GarbageCollectionStats, StoreError>>),
+    RecoverOrphans(Sender<Result<GarbageCollectionStats, StoreError>>),
+    Shutdown,
+}
+
+pub struct StoreHandle {
+    sender: Sender<Command>,
+    actor: Option<thread::JoinHandle<()>>,
+}
+
+impl StoreHandle {
+    pub fn open(options: StoreOptions) -> Result<Self, StoreError> {
+        if options.max_history_items == 0 || options.prune_batch_size == 0 {
+            return Err(StoreError::InvalidData(
+                "retention limits must be greater than zero",
+            ));
+        }
+        let (sender, receiver) = mpsc::channel();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let actor = thread::Builder::new()
+            .name("clipboard-store".into())
+            .spawn(move || run_actor(options, receiver, ready_sender))?;
+        ready_receiver
+            .recv()
+            .map_err(|_| StoreError::ActorStopped)??;
+        Ok(Self {
+            sender,
+            actor: Some(actor),
+        })
+    }
+
+    pub fn quick_check(&self) -> Result<(), StoreError> {
+        self.request(Command::QuickCheck)
+    }
+
+    pub fn stats(&self) -> Result<StoreStats, StoreError> {
+        self.request(Command::Stats)
+    }
+
+    pub fn checkpoint_passive(&self) -> Result<CheckpointResult, StoreError> {
+        self.request(Command::CheckpointPassive)
+    }
+
+    pub fn checkpoint_truncate(&self) -> Result<CheckpointResult, StoreError> {
+        self.request(Command::CheckpointTruncate)
+    }
+
+    pub fn incremental_vacuum(&self, pages: u64) -> Result<(), StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::IncrementalVacuum(pages, reply))
+            .map_err(|_| StoreError::ActorStopped)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn delete(&self, id: ClipId) -> Result<bool, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::Delete(id, reply))
+            .map_err(|_| StoreError::ActorStopped)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn collect_garbage(&self, limit: usize) -> Result<GarbageCollectionStats, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::CollectGarbage(limit, reply))
+            .map_err(|_| StoreError::ActorStopped)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn recover_orphans(&self) -> Result<GarbageCollectionStats, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::RecoverOrphans(reply))
+            .map_err(|_| StoreError::ActorStopped)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    fn request<T>(
+        &self,
+        make_command: impl FnOnce(Sender<Result<T, StoreError>>) -> Command,
+    ) -> Result<T, StoreError> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(make_command(reply))
+            .map_err(|_| StoreError::ActorStopped)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+}
+
+impl HistoryRepository for StoreHandle {
+    type Error = StoreError;
+
+    fn upsert(&self, candidate: ClipCandidate) -> Result<UpsertOutcome, Self::Error> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::Upsert(candidate, reply))
+            .map_err(|_| StoreError::ActorStopped)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    fn recent(&self, limit: usize) -> Result<Vec<ClipSummary>, Self::Error> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::Recent(limit, reply))
+            .map_err(|_| StoreError::ActorStopped)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    fn representations(&self, id: ClipId) -> Result<Vec<Representation>, Self::Error> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::Representations(id, reply))
+            .map_err(|_| StoreError::ActorStopped)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    fn image_preview(&self, id: ClipId) -> Result<Option<ImagePreview>, Self::Error> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::ImagePreview(id, reply))
+            .map_err(|_| StoreError::ActorStopped)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    fn search(&self, query: PlannedQuery, limit: usize) -> Result<Vec<ClipSummary>, Self::Error> {
+        let (reply, receiver) = mpsc::channel();
+        self.sender
+            .send(Command::Search(query, limit, reply))
+            .map_err(|_| StoreError::ActorStopped)?;
+        receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+}
+
+impl Drop for StoreHandle {
+    fn drop(&mut self) {
+        let _ = self.sender.send(Command::Shutdown);
+        if let Some(actor) = self.actor.take() {
+            let _ = actor.join();
+        }
+    }
+}
+
+fn run_actor(
+    options: StoreOptions,
+    receiver: Receiver<Command>,
+    ready: Sender<Result<(), StoreError>>,
+) {
+    let result = open_store(&options);
+    let Ok((mut connection, payload_store)) = result else {
+        let _ = ready.send(result.map(|_| ()));
+        return;
+    };
+    let mut live_count = match repository::count(&connection) {
+        Ok(count) => count,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    while live_count > options.max_history_items {
+        let requested =
+            (live_count - options.max_history_items).min(options.prune_batch_size.max(1));
+        match repository::prune_oldest(&mut connection, requested) {
+            Ok(0) => break,
+            Ok(deleted) => live_count -= deleted,
+            Err(error) => {
+                let _ = ready.send(Err(error));
+                return;
+            }
+        }
+    }
+    let _ = ready.send(Ok(()));
+
+    while let Ok(command) = receiver.recv() {
+        match command {
+            Command::Upsert(candidate, reply) => {
+                let result = repository::upsert(
+                    &mut connection,
+                    &payload_store,
+                    options.inline_threshold,
+                    candidate,
+                    live_count
+                        .saturating_add(1)
+                        .saturating_sub(options.max_history_items)
+                        .min(options.prune_batch_size.max(1)),
+                );
+                match result {
+                    Ok(result) => {
+                        let pruned = result.pruned;
+                        if result.outcome.inserted {
+                            live_count = live_count.saturating_add(1);
+                        }
+                        live_count = live_count.saturating_sub(pruned);
+                        let _ = reply.send(Ok(result.outcome));
+                        if pruned != 0 {
+                            // The capture reply is sent before physical payload cleanup.
+                            // A failed collection leaves the durable queue for a later retry.
+                            let _ = gc::collect_queued(
+                                &mut connection,
+                                &payload_store,
+                                options.prune_batch_size,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            Command::Recent(limit, reply) => {
+                // The SELECT owns no transaction beyond this single request.
+                let _ = reply.send(repository::recent(&connection, limit));
+            }
+            Command::Representations(id, reply) => {
+                let result = repository::representations(
+                    &connection,
+                    &payload_store,
+                    id,
+                    options.max_restore_bytes,
+                );
+                let _ = reply.send(result);
+            }
+            Command::ImagePreview(id, reply) => {
+                let _ = reply.send(repository::image_preview(&connection, id));
+            }
+            Command::Search(query, limit, reply) => {
+                let _ = reply.send(repository::search(&connection, query, limit));
+            }
+            Command::QuickCheck(reply) => {
+                let result = connection
+                    .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+                    .map_err(StoreError::from)
+                    .and_then(|value| {
+                        (value == "ok")
+                            .then_some(())
+                            .ok_or(StoreError::InvalidData("quick_check failed"))
+                    });
+                let _ = reply.send(result);
+            }
+            Command::Stats(reply) => {
+                let result = store_stats(&connection, &options.database_path);
+                let _ = reply.send(result);
+            }
+            Command::CheckpointPassive(reply) => {
+                let result = checkpoint(&connection, "PASSIVE");
+                let _ = reply.send(result);
+            }
+            Command::CheckpointTruncate(reply) => {
+                let result = checkpoint(&connection, "TRUNCATE");
+                let _ = reply.send(result);
+            }
+            Command::IncrementalVacuum(pages, reply) => {
+                let result = connection
+                    .execute_batch(&format!("PRAGMA incremental_vacuum({pages})"))
+                    .map_err(Into::into);
+                let _ = reply.send(result);
+            }
+            Command::Delete(id, reply) => {
+                let result = connection
+                    .execute("DELETE FROM clips WHERE id = ?1", [id.0])
+                    .map(|deleted| deleted != 0)
+                    .map_err(Into::into);
+                if matches!(result, Ok(true)) {
+                    live_count = live_count.saturating_sub(1);
+                }
+                let _ = reply.send(result);
+            }
+            Command::CollectGarbage(limit, reply) => {
+                let result = gc::collect_queued(&mut connection, &payload_store, limit);
+                let _ = reply.send(result);
+            }
+            Command::RecoverOrphans(reply) => {
+                let result = gc::collect_orphans(&connection, &payload_store);
+                let _ = reply.send(result);
+            }
+            Command::Shutdown => break,
+        }
+    }
+}
+
+fn open_store(options: &StoreOptions) -> Result<(Connection, PayloadStore), StoreError> {
+    if let Some(parent) = options.database_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut connection = Connection::open(&options.database_path)?;
+    configure_connection(&connection, options.cache_kib)?;
+    migrate(&mut connection)?;
+    Ok((connection, PayloadStore::new(&options.payload_directory)))
+}
+
+fn store_stats(connection: &Connection, path: &std::path::Path) -> Result<StoreStats, StoreError> {
+    let page_count =
+        connection.pragma_query_value(None, "page_count", |row| row.get::<_, i64>(0))? as u64;
+    let freelist_count =
+        connection.pragma_query_value(None, "freelist_count", |row| row.get::<_, i64>(0))? as u64;
+    let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+    let wal_bytes = std::fs::metadata(wal_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    Ok(StoreStats {
+        page_count,
+        freelist_count,
+        wal_bytes,
+    })
+}
+
+fn checkpoint(connection: &Connection, mode: &str) -> Result<CheckpointResult, StoreError> {
+    connection
+        .query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
+            Ok(CheckpointResult {
+                busy: row.get::<_, i64>(0)? as u64,
+                log_frames: row.get::<_, i64>(1)? as u64,
+                checkpointed_frames: row.get::<_, i64>(2)? as u64,
+            })
+        })
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clipboard_core::{
+        ClipKind, ClipboardSnapshot, HistoryService, ImagePreview, Representation, SearchTextPolicy,
+    };
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn actor_persists_and_touches_without_duplicate() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-store-test-{unique}"));
+        let options = StoreOptions::new(root.join("history.sqlite"), root.join("payloads"));
+        let service = HistoryService::new(
+            StoreHandle::open(options).unwrap(),
+            SearchTextPolicy::default(),
+        );
+        let snapshot = ClipboardSnapshot {
+            representations: vec![Representation {
+                uti: "public.utf8-plain-text".into(),
+                bytes: b"hello".to_vec(),
+            }],
+            image_preview: None,
+        };
+        service
+            .capture(snapshot.clone(), ClipKind::Text, 1)
+            .unwrap();
+        assert!(!service.repository().recent(10).unwrap()[0].has_image_preview);
+        let mut touched_snapshot = snapshot;
+        touched_snapshot.image_preview = Some(ImagePreview {
+            uti: "public.png".into(),
+            bytes: vec![1, 2, 3, 4],
+        });
+        service
+            .capture(touched_snapshot, ClipKind::Text, 2)
+            .unwrap();
+        let rows = service.repository().recent(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].copy_count, 2);
+        assert_eq!(rows[0].last_used_at_ms, 2);
+        assert!(rows[0].has_image_preview);
+        assert_eq!(
+            service.image_preview(rows[0].id).unwrap(),
+            Some(ImagePreview {
+                uti: "public.png".into(),
+                bytes: vec![1, 2, 3, 4],
+            })
+        );
+        service.repository().quick_check().unwrap();
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preview_size_is_bounded_before_sql_commit() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-preview-limit-test-{unique}"));
+        let service = HistoryService::new(
+            StoreHandle::open(StoreOptions::new(
+                root.join("history.sqlite"),
+                root.join("payloads"),
+            ))
+            .unwrap(),
+            SearchTextPolicy::default(),
+        );
+        let result = service.capture(
+            ClipboardSnapshot {
+                representations: vec![Representation {
+                    uti: "public.png".into(),
+                    bytes: vec![9; 128],
+                }],
+                image_preview: Some(ImagePreview {
+                    uti: "public.png".into(),
+                    bytes: vec![7; 64 * 1024 + 1],
+                }),
+            },
+            ClipKind::Image,
+            1,
+        );
+        assert!(matches!(
+            result,
+            Err(StoreError::InvalidData(
+                "image preview must contain between 1 and 65536 bytes"
+            ))
+        ));
+        assert_eq!(service.repository().recent(10).unwrap().len(), 0);
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_enqueues_and_gc_removes_external_payload() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-gc-test-{unique}"));
+        let options = StoreOptions::new(root.join("history.sqlite"), root.join("payloads"));
+        let service = HistoryService::new(
+            StoreHandle::open(options).unwrap(),
+            SearchTextPolicy::default(),
+        );
+        let snapshot = ClipboardSnapshot {
+            representations: vec![Representation {
+                uti: "public.data".into(),
+                bytes: vec![7; 32 * 1024],
+            }],
+            image_preview: None,
+        };
+        let outcome = service.capture(snapshot, ClipKind::Image, 1).unwrap();
+        let clipboard_core::CaptureOutcome::Stored(stored) = outcome else {
+            panic!("expected stored clip")
+        };
+        let selected = service.select(stored.id).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].bytes, vec![7; 32 * 1024]);
+        assert!(service.repository().delete(stored.id).unwrap());
+        let stats = service.repository().collect_garbage(100).unwrap();
+        assert_eq!(stats.queued_scanned, 1);
+        assert_eq!(stats.payload_files_deleted, 1);
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gc_keeps_shared_payload_until_last_reference_is_deleted() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-shared-gc-test-{unique}"));
+        let options = StoreOptions::new(root.join("history.sqlite"), root.join("payloads"));
+        let service = HistoryService::new(
+            StoreHandle::open(options).unwrap(),
+            SearchTextPolicy::default(),
+        );
+        for (timestamp, text) in [(1, b"first".as_slice()), (2, b"second".as_slice())] {
+            service
+                .capture(
+                    ClipboardSnapshot {
+                        representations: vec![
+                            Representation {
+                                uti: "public.utf8-plain-text".into(),
+                                bytes: text.to_vec(),
+                            },
+                            Representation {
+                                uti: "public.data".into(),
+                                bytes: vec![7; 32 * 1024],
+                            },
+                        ],
+                        image_preview: None,
+                    },
+                    ClipKind::Mixed,
+                    timestamp,
+                )
+                .unwrap();
+        }
+        let rows = service.repository().recent(10).unwrap();
+        service.repository().delete(rows[1].id).unwrap();
+        let first_gc = service.repository().collect_garbage(100).unwrap();
+        assert_eq!(first_gc.referenced_skipped, 1);
+        assert_eq!(first_gc.payload_files_deleted, 0);
+
+        service.repository().delete(rows[0].id).unwrap();
+        let final_gc = service.repository().collect_garbage(100).unwrap();
+        assert_eq!(final_gc.payload_files_deleted, 1);
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn actor_enforces_history_limit_without_loading_history() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-retention-test-{unique}"));
+        let mut options = StoreOptions::new(root.join("history.sqlite"), root.join("payloads"));
+        options.max_history_items = 2;
+        let service = HistoryService::new(
+            StoreHandle::open(options).unwrap(),
+            SearchTextPolicy::default(),
+        );
+
+        for (timestamp, value) in [(1, "first"), (2, "second"), (3, "third")] {
+            service
+                .capture(
+                    ClipboardSnapshot {
+                        representations: vec![Representation {
+                            uti: "public.utf8-plain-text".into(),
+                            bytes: value.as_bytes().to_vec(),
+                        }],
+                        image_preview: None,
+                    },
+                    ClipKind::Text,
+                    timestamp,
+                )
+                .unwrap();
+        }
+
+        let rows = service.repository().recent(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].preview.as_deref(), Some("third"));
+        assert_eq!(rows[1].preview.as_deref(), Some("second"));
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn select_rejects_payload_over_restore_memory_limit() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-restore-limit-test-{unique}"));
+        let mut options = StoreOptions::new(root.join("history.sqlite"), root.join("payloads"));
+        options.max_restore_bytes = 8;
+        let service = HistoryService::new(
+            StoreHandle::open(options).unwrap(),
+            SearchTextPolicy::default(),
+        );
+        let outcome = service
+            .capture(
+                ClipboardSnapshot {
+                    representations: vec![Representation {
+                        uti: "public.utf8-plain-text".into(),
+                        bytes: b"more than eight bytes".to_vec(),
+                    }],
+                    image_preview: None,
+                },
+                ClipKind::Text,
+                1,
+            )
+            .unwrap();
+        let clipboard_core::CaptureOutcome::Stored(stored) = outcome else {
+            panic!("expected stored clip")
+        };
+        assert!(matches!(
+            service.select(stored.id),
+            Err(StoreError::InvalidData(
+                "clip exceeds the configured restore byte limit"
+            ))
+        ));
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn actor_searches_exact_prefix_and_literal_substring_without_fuzzy_matching() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-search-test-{unique}"));
+        let service = HistoryService::new(
+            StoreHandle::open(StoreOptions::new(
+                root.join("history.sqlite"),
+                root.join("payloads"),
+            ))
+            .unwrap(),
+            SearchTextPolicy::default(),
+        );
+        for (timestamp, value) in [
+            (1, "alpha"),
+            (2, "alphabet"),
+            (3, "x alpha y"),
+            (4, "100% real"),
+            (5, "a_b"),
+        ] {
+            service
+                .capture(
+                    ClipboardSnapshot {
+                        representations: vec![Representation {
+                            uti: "public.utf8-plain-text".into(),
+                            bytes: value.as_bytes().to_vec(),
+                        }],
+                        image_preview: None,
+                    },
+                    ClipKind::Text,
+                    timestamp,
+                )
+                .unwrap();
+        }
+
+        let exact = service
+            .search("alpha", clipboard_core::MatchMode::Exact, 50)
+            .unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].preview.as_deref(), Some("alpha"));
+
+        let prefix = service
+            .search("alpha", clipboard_core::MatchMode::Prefix, 50)
+            .unwrap();
+        assert_eq!(prefix.len(), 2);
+        let substring = service
+            .search("alpha", clipboard_core::MatchMode::Substring, 50)
+            .unwrap();
+        assert_eq!(substring.len(), 3);
+
+        let literal_percent = service
+            .search("100%", clipboard_core::MatchMode::Substring, 50)
+            .unwrap();
+        assert_eq!(literal_percent.len(), 1);
+        assert_eq!(literal_percent[0].preview.as_deref(), Some("100% real"));
+        let literal_underscore = service
+            .search("a_b", clipboard_core::MatchMode::Exact, 50)
+            .unwrap();
+        assert_eq!(literal_underscore.len(), 1);
+        assert_eq!(literal_underscore[0].preview.as_deref(), Some("a_b"));
+
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
