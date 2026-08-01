@@ -2,7 +2,7 @@ use rusqlite::Connection;
 
 use crate::StoreError;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 pub fn configure_connection(connection: &Connection, cache_kib: usize) -> Result<(), StoreError> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -73,6 +73,14 @@ pub fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
                 enqueued_at  INTEGER NOT NULL
             ) WITHOUT ROWID;
 
+            CREATE TABLE maintenance_state (
+                id                           INTEGER PRIMARY KEY CHECK (id = 1),
+                deleted_since_fts_optimize  INTEGER NOT NULL DEFAULT 0,
+                last_fts_optimize_at        INTEGER NOT NULL DEFAULT 0
+            );
+
+            INSERT INTO maintenance_state(id) VALUES (1);
+
             CREATE TRIGGER representations_queue_payload_gc
             AFTER DELETE ON representations
             WHEN old.payload_hash IS NOT NULL
@@ -113,6 +121,14 @@ pub fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
                 VALUES ('delete', old.id, old.normalized_text);
             END;
 
+            CREATE TRIGGER clips_fts_maintenance_delete AFTER DELETE ON clips
+            WHEN old.normalized_text IS NOT NULL
+            BEGIN
+                UPDATE maintenance_state
+                SET deleted_since_fts_optimize = deleted_since_fts_optimize + 1
+                WHERE id = 1;
+            END;
+
             CREATE TRIGGER clips_fts_update AFTER UPDATE OF normalized_text ON clips
             BEGIN
                 INSERT INTO clips_fts(clips_fts, rowid, normalized_text)
@@ -121,6 +137,15 @@ pub fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
                 INSERT INTO clips_fts(rowid, normalized_text)
                 SELECT new.id, new.normalized_text
                 WHERE new.normalized_text IS NOT NULL;
+            END;
+
+            CREATE TRIGGER clips_fts_maintenance_update
+            AFTER UPDATE OF normalized_text ON clips
+            WHEN old.normalized_text IS NOT NULL
+            BEGIN
+                UPDATE maintenance_state
+                SET deleted_since_fts_optimize = deleted_since_fts_optimize + 1
+                WHERE id = 1;
             END;
             ",
         )?;
@@ -134,7 +159,63 @@ pub fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
                 clip_id INTEGER PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
                 uti     TEXT NOT NULL,
                 data    BLOB NOT NULL CHECK (length(data) <= 65536)
-            );",
+            );
+
+            CREATE TABLE maintenance_state (
+                id                           INTEGER PRIMARY KEY CHECK (id = 1),
+                deleted_since_fts_optimize  INTEGER NOT NULL DEFAULT 0,
+                last_fts_optimize_at        INTEGER NOT NULL DEFAULT 0
+            );
+
+            INSERT INTO maintenance_state(id) VALUES (1);
+
+            CREATE TRIGGER clips_fts_maintenance_delete AFTER DELETE ON clips
+            WHEN old.normalized_text IS NOT NULL
+            BEGIN
+                UPDATE maintenance_state
+                SET deleted_since_fts_optimize = deleted_since_fts_optimize + 1
+                WHERE id = 1;
+            END;
+
+            CREATE TRIGGER clips_fts_maintenance_update
+            AFTER UPDATE OF normalized_text ON clips
+            WHEN old.normalized_text IS NOT NULL
+            BEGIN
+                UPDATE maintenance_state
+                SET deleted_since_fts_optimize = deleted_since_fts_optimize + 1
+                WHERE id = 1;
+            END;",
+        )?;
+        transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+        transaction.commit()?;
+    }
+    if version == 2 {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE maintenance_state (
+                id                           INTEGER PRIMARY KEY CHECK (id = 1),
+                deleted_since_fts_optimize  INTEGER NOT NULL DEFAULT 0,
+                last_fts_optimize_at        INTEGER NOT NULL DEFAULT 0
+            );
+
+            INSERT INTO maintenance_state(id) VALUES (1);
+
+            CREATE TRIGGER clips_fts_maintenance_delete AFTER DELETE ON clips
+            WHEN old.normalized_text IS NOT NULL
+            BEGIN
+                UPDATE maintenance_state
+                SET deleted_since_fts_optimize = deleted_since_fts_optimize + 1
+                WHERE id = 1;
+            END;
+
+            CREATE TRIGGER clips_fts_maintenance_update
+            AFTER UPDATE OF normalized_text ON clips
+            WHEN old.normalized_text IS NOT NULL
+            BEGIN
+                UPDATE maintenance_state
+                SET deleted_since_fts_optimize = deleted_since_fts_optimize + 1
+                WHERE id = 1;
+            END;",
         )?;
         transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         transaction.commit()?;

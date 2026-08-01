@@ -1,6 +1,6 @@
 # macOS application shell
 
-Swift/AppKitとRust/UniFFIの境界を検証する最小アプリです。`ClipboardEngine`を通してstore actorへ接続され、capture、recent、recopy=touch、delete、payload GC、representationの復元までを呼び出せます。UIは最近50件だけを一覧表示し、ダブルクリックまたはReturnで選択履歴をNSPasteboardへ戻せます。
+Swift/AppKitとRust/UniFFIの境界を検証する最小アプリです。`ClipboardEngine`を通してstore actorへ接続され、capture、recent、recopy=touch、delete、payload GC、representationの復元までを呼び出せます。UIは最近50件だけを一覧表示し、ダブルクリックまたはReturnで選択履歴をNSPasteboardへ戻せます。store actorのWAL checkpoint、bounded vacuum、条件付きFTS5 optimizeは、AppKitの活動が少ない時間帯にバックグラウンドschedulerから実行されます。
 
 captureは必ず2段階で行います。
 

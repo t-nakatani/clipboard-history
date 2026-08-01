@@ -30,6 +30,7 @@ pub struct StoreOptions {
     pub max_history_items: usize,
     pub prune_batch_size: usize,
     pub max_restore_bytes: usize,
+    pub maintenance: MaintenancePolicy,
 }
 
 impl StoreOptions {
@@ -42,6 +43,7 @@ impl StoreOptions {
             max_history_items: 100_000,
             prune_batch_size: 1_000,
             max_restore_bytes: 64 * 1024 * 1024,
+            maintenance: MaintenancePolicy::default(),
         }
     }
 }
@@ -58,6 +60,45 @@ pub struct CheckpointResult {
     pub busy: u64,
     pub log_frames: u64,
     pub checkpointed_frames: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaintenanceTrigger {
+    Periodic,
+    Idle,
+    DeepIdle,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MaintenanceReport {
+    pub garbage_collection: GarbageCollectionStats,
+    pub passive_checkpoint: Option<CheckpointResult>,
+    pub truncate_checkpoint: Option<CheckpointResult>,
+    pub vacuum_pages: u64,
+    pub fts_optimized: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct MaintenancePolicy {
+    pub passive_checkpoint_wal_bytes: u64,
+    pub truncate_checkpoint_wal_bytes: u64,
+    pub vacuum_freelist_pages: u64,
+    pub vacuum_step_pages: u64,
+    pub gc_batch_size: usize,
+    pub fts_optimize_deleted_rows: u64,
+}
+
+impl Default for MaintenancePolicy {
+    fn default() -> Self {
+        Self {
+            passive_checkpoint_wal_bytes: 4 * 1024 * 1024,
+            truncate_checkpoint_wal_bytes: 16 * 1024 * 1024,
+            vacuum_freelist_pages: 2_048,
+            vacuum_step_pages: 256,
+            gc_batch_size: 256,
+            fts_optimize_deleted_rows: 10_000,
+        }
+    }
 }
 
 enum Command {
@@ -86,6 +127,10 @@ enum Command {
     CollectGarbage(usize, Sender<Result<GarbageCollectionStats, StoreError>>),
     RecoverOrphans(Sender<Result<GarbageCollectionStats, StoreError>>),
     RecoverStartup(Sender<Result<StartupRecoveryReport, StoreError>>),
+    RunMaintenance(
+        MaintenanceTrigger,
+        Sender<Result<MaintenanceReport, StoreError>>,
+    ),
     Shutdown(Sender<Result<(), StoreError>>),
 }
 
@@ -204,6 +249,13 @@ impl StoreHandle {
             .send(Command::RecoverOrphans(reply))
             .map_err(|_| StoreError::ActorStopped)?;
         receiver.recv().map_err(|_| StoreError::ActorStopped)?
+    }
+
+    pub fn run_maintenance(
+        &self,
+        trigger: MaintenanceTrigger,
+    ) -> Result<MaintenanceReport, StoreError> {
+        self.request(|reply| Command::RunMaintenance(trigger, reply))
     }
 
     fn request<T>(
@@ -459,6 +511,16 @@ fn run_actor(
                     }
                 }
             }
+            Command::RunMaintenance(trigger, reply) => {
+                let result = run_maintenance(
+                    &mut connection,
+                    &payload_store,
+                    &options.database_path,
+                    &options.maintenance,
+                    trigger,
+                );
+                let _ = reply.send(result);
+            }
             Command::Shutdown(reply) => {
                 let result = checkpoint(&connection, "TRUNCATE")
                     .map(|_| ())
@@ -541,6 +603,83 @@ fn checkpoint(connection: &Connection, mode: &str) -> Result<CheckpointResult, S
         .map_err(Into::into)
 }
 
+fn run_maintenance(
+    connection: &mut Connection,
+    payload_store: &PayloadStore,
+    database_path: &std::path::Path,
+    policy: &MaintenancePolicy,
+    trigger: MaintenanceTrigger,
+) -> Result<MaintenanceReport, StoreError> {
+    let garbage_collection = gc::collect_queued(connection, payload_store, policy.gc_batch_size)?;
+    let mut report = MaintenanceReport {
+        garbage_collection,
+        ..MaintenanceReport::default()
+    };
+
+    let state = maintenance_state(connection)?;
+    if matches!(trigger, MaintenanceTrigger::DeepIdle)
+        && state.deleted_since_fts_optimize >= policy.fts_optimize_deleted_rows
+    {
+        optimize_fts(connection)?;
+        report.fts_optimized = true;
+    }
+
+    let stats_before_vacuum = store_stats(connection, database_path)?;
+    if !matches!(trigger, MaintenanceTrigger::Periodic)
+        && stats_before_vacuum.freelist_count >= policy.vacuum_freelist_pages
+    {
+        connection.execute_batch(&format!(
+            "PRAGMA incremental_vacuum({})",
+            policy.vacuum_step_pages
+        ))?;
+        let stats_after_vacuum = store_stats(connection, database_path)?;
+        report.vacuum_pages = stats_before_vacuum
+            .freelist_count
+            .saturating_sub(stats_after_vacuum.freelist_count);
+    }
+
+    let stats = store_stats(connection, database_path)?;
+    if stats.wal_bytes >= policy.truncate_checkpoint_wal_bytes
+        && !matches!(trigger, MaintenanceTrigger::Periodic)
+    {
+        report.truncate_checkpoint = Some(checkpoint(connection, "TRUNCATE")?);
+    } else if stats.wal_bytes >= policy.passive_checkpoint_wal_bytes {
+        report.passive_checkpoint = Some(checkpoint(connection, "PASSIVE")?);
+    }
+    Ok(report)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MaintenanceState {
+    deleted_since_fts_optimize: u64,
+}
+
+fn maintenance_state(connection: &Connection) -> Result<MaintenanceState, StoreError> {
+    connection
+        .query_row(
+            "SELECT deleted_since_fts_optimize FROM maintenance_state WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| MaintenanceState {
+            deleted_since_fts_optimize: value.max(0) as u64,
+        })
+        .map_err(Into::into)
+}
+
+fn optimize_fts(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "INSERT INTO clips_fts(clips_fts) VALUES ('optimize');
+         UPDATE maintenance_state
+         SET deleted_since_fts_optimize = 0,
+             last_fts_optimize_at = unixepoch('subsec') * 1000
+         WHERE id = 1;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,7 +688,8 @@ mod tests {
         quarantined_payload_path, write_quarantine_manifest,
     };
     use clipboard_core::{
-        ClipKind, ClipboardSnapshot, HistoryService, ImagePreview, Representation, SearchTextPolicy,
+        CaptureOutcome, ClipKind, ClipboardSnapshot, HistoryService, ImagePreview, Representation,
+        SearchTextPolicy,
     };
     use std::fs::OpenOptions;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1389,6 +1529,54 @@ mod tests {
 
         let reopened = StoreHandle::open(options.clone()).unwrap();
         assert!(reopened.startup_recovery_required());
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn maintenance_runs_bounded_gc_checkpoints_and_conditional_fts_optimize() {
+        let root = unique_test_root("clipboard-maintenance-test");
+        let mut options = StoreOptions::new(root.join("history.sqlite"), root.join("payloads"));
+        options.maintenance.passive_checkpoint_wal_bytes = 0;
+        options.maintenance.truncate_checkpoint_wal_bytes = 0;
+        options.maintenance.vacuum_freelist_pages = 0;
+        options.maintenance.fts_optimize_deleted_rows = 1;
+        options.maintenance.vacuum_step_pages = 1;
+        let store = StoreHandle::open(options.clone()).unwrap();
+        let service = HistoryService::new(store, SearchTextPolicy::default());
+
+        let outcome = service
+            .capture(
+                ClipboardSnapshot {
+                    representations: vec![Representation {
+                        uti: "public.utf8-plain-text".into(),
+                        bytes: b"maintenance fixture".to_vec(),
+                    }],
+                    image_preview: None,
+                },
+                ClipKind::Text,
+                1,
+            )
+            .unwrap();
+        let CaptureOutcome::Stored(stored) = outcome else {
+            panic!("expected stored clip")
+        };
+        assert!(service.repository().delete(stored.id).unwrap());
+
+        drop(service);
+        let reopened = StoreHandle::open(options).unwrap();
+        let report = reopened
+            .run_maintenance(MaintenanceTrigger::DeepIdle)
+            .unwrap();
+        assert!(report.fts_optimized);
+        assert!(report.truncate_checkpoint.is_some());
+        assert_eq!(report.garbage_collection.queued_scanned, 0);
+
+        let second = reopened
+            .run_maintenance(MaintenanceTrigger::DeepIdle)
+            .unwrap();
+        assert!(!second.fts_optimized);
+
         drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
     }
