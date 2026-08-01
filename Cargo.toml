@@ -16,7 +16,7 @@ publish = false
 
 [workspace.dependencies]
 blake3 = "1.8.5"
-rusqlite = { version = "=0.39.0", features = ["bundled"] }
+rusqlite = { version = "=0.40.1", features = ["bundled"] }
 uniffi = "0.32.0"
 
 [profile.release]
