@@ -2,6 +2,9 @@ import AppKit
 import Foundation
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
+    /// macOS force-terminates an app that lingers in `applicationWillTerminate`.
+    private static let shutdownTimeout: TimeInterval = 2
+
     private let uiConfiguration = HistoryPanelConfiguration.standard
     private var statusItem: NSStatusItem?
     private var monitor: PasteboardMonitor?
@@ -61,10 +64,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         searchTimer?.invalidate()
         maintenanceScheduler.stop()
         monitor?.stop()
+        guard let storeClient else { return }
         do {
-            try storeClient?.shutdown()
+            // Stopping the scheduler prevents new requests but cannot cancel one
+            // already running, so bound the wait rather than hold the main thread.
+            if try storeClient.shutdown(timeout: Self.shutdownTimeout) == .timedOut {
+                NSLog("Clipboard History clean shutdown timed out; the next launch will run startup recovery")
+            }
         } catch {
-            NSLog("Clipboard History clean shutdown failed: \(error.localizedDescription)")
+            NSLog("Clipboard History clean shutdown failed: %@", error.localizedDescription)
         }
     }
 
@@ -144,28 +152,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             onRejection: { [weak self] decision in self?.show(rejection: decision) }
         )
         monitor?.start()
-        statusLabel.stringValue = "コピー待機中"
-        reloadHistory()
-        if storeClient.startupRecoveryRequired {
-            statusLabel.stringValue = "前回の終了状態を検証中…"
-            storeClient.recoverStartup { [weak self] result in
-                switch result {
-                case let .success(report):
-                    if report.databaseRebuilt {
-                        self?.statusLabel.stringValue = "破損した履歴を隔離して再構築"
-                        self?.detailLabel.stringValue = report.quarantinePath ?? "隔離先を確認できません"
-                        self?.reloadHistory()
-                    } else {
-                        let removed = report.garbageCollection.payloadFilesDeleted
-                            + report.garbageCollection.orphanFilesDeleted
-                            + report.garbageCollection.stagedFilesDeleted
-                        self?.statusLabel.stringValue = "起動時リカバリー完了"
-                        self?.detailLabel.stringValue = "孤児payload \(removed)件を回収"
-                    }
-                case let .failure(error):
-                    self?.show(error: error)
+        guard storeClient.startupRecoveryRequired else {
+            statusLabel.stringValue = "コピー待機中"
+            reloadHistory()
+            return
+        }
+        recoverStartup(storeClient: storeClient)
+    }
+
+    /// Repairs the store before the first read.
+    ///
+    /// Recovery can quarantine and rebuild the database, so reading history
+    /// first would either surface an error from a store that is about to be
+    /// repaired, or race the recovery outcome against the loaded page for
+    /// ownership of the status labels.
+    private func recoverStartup(storeClient: HistoryStoreClient) {
+        statusLabel.stringValue = "前回の終了状態を検証中…"
+        storeClient.recoverStartup { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case let .success(report):
+                // The status label belongs to the load that follows, so the
+                // outcome goes to the detail label to survive it. After a
+                // rebuild the history is empty, so the load leaves it alone.
+                if report.databaseRebuilt {
+                    let quarantine = report.quarantinePath ?? "隔離先を確認できません"
+                    self.detailLabel.stringValue = "破損した履歴を隔離して再構築 · \(quarantine)"
+                } else {
+                    let removed = report.garbageCollection.payloadFilesDeleted
+                        + report.garbageCollection.orphanFilesDeleted
+                        + report.garbageCollection.stagedFilesDeleted
+                    self.detailLabel.stringValue = "起動時リカバリー完了 · 孤児payload \(removed)件を回収"
                 }
+            case let .failure(error):
+                // Rust keeps the recovery marker so the next launch retries. The
+                // connection may still be usable, so load rather than leave the
+                // panel empty; a broken store fails again in reloadHistory.
+                NSLog("Clipboard History startup recovery failed: %@", error.localizedDescription)
+                self.detailLabel.stringValue = "起動時リカバリーに失敗: \(error.localizedDescription)"
             }
+            self.reloadHistory()
         }
     }
 
