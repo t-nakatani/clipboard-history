@@ -1,8 +1,8 @@
 use clipboard_core::{
-    ClipCandidate, ClipId, ClipKind, ClipSummary, ImagePreview, MatchMode, PlannedQuery,
-    Representation, UpsertOutcome,
+    ClipCandidate, ClipId, ClipKind, ClipSummary, HistoryCursor, HistoryPage, ImagePreview,
+    MatchMode, PageDirection, PlannedQuery, Representation, UpsertOutcome,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, named_params, params};
 
 use crate::{PayloadStore, StoreError};
 
@@ -182,38 +182,37 @@ fn insert_representation(
     Ok(())
 }
 
-pub(crate) fn recent(
+pub(crate) fn recent_page(
     connection: &Connection,
+    cursor: Option<HistoryCursor>,
+    direction: PageDirection,
     limit: usize,
-) -> Result<Vec<ClipSummary>, StoreError> {
-    let mut statement = connection.prepare(
+) -> Result<HistoryPage, StoreError> {
+    let limit = limit.clamp(1, 200);
+    let fetch_limit = (limit + 1) as i64;
+    let page = PageSql::new(cursor, direction)?;
+    let sql = format!(
         "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
                 c.payload_size, substr(c.normalized_text, 1, 256),
                 EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
          FROM clips AS c
-         ORDER BY last_used_at DESC, id DESC
-         LIMIT ?1",
+         WHERE {}
+         ORDER BY c.last_used_at {}, c.id {}
+         LIMIT :limit",
+        page.predicate("c"),
+        page.order,
+        page.order
+    );
+    let items = query_summaries(
+        connection,
+        &sql,
+        named_params! {
+            ":anchor_time": page.anchor.last_used_at_ms,
+            ":anchor_id": page.anchor.id.0,
+            ":limit": fetch_limit,
+        },
     )?;
-    let rows = statement.query_map([limit.min(1000) as i64], |row| {
-        let raw_kind: i64 = row.get(1)?;
-        let kind = match raw_kind {
-            0 => ClipKind::Text,
-            1 => ClipKind::Image,
-            2 => ClipKind::File,
-            _ => ClipKind::Mixed,
-        };
-        Ok(ClipSummary {
-            id: ClipId(row.get(0)?),
-            kind,
-            last_used_at_ms: row.get(2)?,
-            pinned: row.get(3)?,
-            copy_count: row.get::<_, i64>(4)? as u64,
-            payload_size: row.get::<_, i64>(5)? as u64,
-            preview: row.get(6)?,
-            has_image_preview: row.get(7)?,
-        })
-    })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    Ok(history_page(items, limit, page.reverse))
 }
 
 pub(crate) fn image_preview(
@@ -293,86 +292,255 @@ pub(crate) fn representations(
     Ok(result)
 }
 
-pub(crate) fn search(
+pub(crate) fn search_page(
     connection: &Connection,
     query: PlannedQuery,
+    cursor: Option<HistoryCursor>,
+    direction: PageDirection,
     limit: usize,
-) -> Result<Vec<ClipSummary>, StoreError> {
-    let limit = limit.clamp(1, 200) as i64;
+) -> Result<HistoryPage, StoreError> {
+    let limit = limit.clamp(1, 200);
+    let fetch_limit = (limit + 1) as i64;
+    let page = PageSql::new(cursor, direction)?;
     match query {
-        PlannedQuery::Empty => recent(connection, limit as usize),
-        PlannedQuery::RecentScan { mode, needle } => query_summaries(
-            connection,
-            "SELECT id, content_kind, last_used_at, pinned, copy_count,
-                    payload_size, substr(normalized_text, 1, 256), has_image_preview
-             FROM (
-                 SELECT id, content_kind, last_used_at, pinned, copy_count,
-                        payload_size, normalized_text,
-                        EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = clips.id)
-                            AS has_image_preview
-                 FROM clips
-                 WHERE normalized_text IS NOT NULL
-                 ORDER BY last_used_at DESC, id DESC
-                 LIMIT 2000
-             )
-             WHERE normalized_text LIKE ?1 ESCAPE '\\'
-             ORDER BY last_used_at DESC, id DESC
-             LIMIT ?2",
-            params![like_pattern(mode, &needle), limit],
-        ),
+        PlannedQuery::Empty => recent_page(connection, cursor, direction, limit),
+        PlannedQuery::RecentScan { mode, needle } => {
+            let pattern = like_pattern(mode, &needle);
+            let sql = format!(
+                "SELECT id, content_kind, last_used_at, pinned, copy_count,
+                        payload_size, substr(normalized_text, 1, 256), has_image_preview
+                 FROM (
+                     SELECT id, content_kind, last_used_at, pinned, copy_count,
+                            payload_size, normalized_text,
+                            EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = clips.id)
+                                AS has_image_preview
+                     FROM clips
+                     WHERE normalized_text IS NOT NULL AND {}
+                     ORDER BY last_used_at {}, id {}
+                     LIMIT 2000
+                 )
+                 WHERE normalized_text LIKE :pattern ESCAPE '\\'
+                 ORDER BY last_used_at {}, id {}
+                 LIMIT :limit",
+                page.predicate("clips"),
+                page.order,
+                page.order,
+                page.order,
+                page.order
+            );
+            let items = query_summaries(
+                connection,
+                &sql,
+                named_params! {
+                    ":pattern": pattern,
+                    ":anchor_time": page.anchor.last_used_at_ms,
+                    ":anchor_id": page.anchor.id.0,
+                    ":limit": fetch_limit,
+                },
+            )?;
+            if items.len() > limit {
+                return Ok(history_page(items, limit, page.reverse));
+            }
+            if let Some(continuation_cursor) = recent_scan_boundary(connection, page)? {
+                let mut items = items;
+                if page.reverse {
+                    items.reverse();
+                }
+                return Ok(HistoryPage {
+                    items,
+                    continuation_cursor: Some(continuation_cursor),
+                    has_more: true,
+                    truncated: true,
+                });
+            }
+            Ok(history_page(items, limit, page.reverse))
+        }
         PlannedQuery::Indexed {
             mode: MatchMode::Prefix,
             needle,
-        } => search_prefix(connection, &needle, limit),
-        PlannedQuery::Indexed { mode, needle } => query_summaries(
-            connection,
-            "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
-                    c.payload_size, substr(c.normalized_text, 1, 256),
-                    EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
-             FROM clips_fts
-             JOIN clips AS c ON c.id = clips_fts.rowid
-             WHERE clips_fts.normalized_text LIKE ?1 ESCAPE '\\'
-             ORDER BY c.last_used_at DESC, c.id DESC
-             LIMIT ?2",
-            params![like_pattern(mode, &needle), limit],
-        ),
+        } => search_prefix_page(connection, &needle, page, limit),
+        PlannedQuery::Indexed { mode, needle } => {
+            let pattern = like_pattern(mode, &needle);
+            let sql = format!(
+                "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
+                        c.payload_size, substr(c.normalized_text, 1, 256),
+                        EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
+                 FROM clips_fts
+                 JOIN clips AS c ON c.id = clips_fts.rowid
+                 WHERE clips_fts.normalized_text LIKE :pattern ESCAPE '\\'
+                   AND {}
+                 ORDER BY c.last_used_at {}, c.id {}
+                 LIMIT :limit",
+                page.predicate("c"),
+                page.order,
+                page.order
+            );
+            let items = query_summaries(
+                connection,
+                &sql,
+                named_params! {
+                    ":pattern": pattern,
+                    ":anchor_time": page.anchor.last_used_at_ms,
+                    ":anchor_id": page.anchor.id.0,
+                    ":limit": fetch_limit,
+                },
+            )?;
+            Ok(history_page(items, limit, page.reverse))
+        }
     }
 }
 
-fn search_prefix(
+fn search_prefix_page(
     connection: &Connection,
     needle: &str,
-    limit: i64,
-) -> Result<Vec<ClipSummary>, StoreError> {
+    page: PageSql,
+    limit: usize,
+) -> Result<HistoryPage, StoreError> {
     let pattern = like_pattern(MatchMode::Prefix, needle);
-    if needle.chars().count() <= 64 {
-        query_summaries(
-            connection,
-            "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
-                    c.payload_size, substr(c.normalized_text, 1, 256),
-                    EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
-             FROM clips AS c
-             WHERE substr(normalized_text, 1, 64) LIKE ?1 ESCAPE '\\'
-               AND normalized_text LIKE ?1 ESCAPE '\\'
-             ORDER BY last_used_at DESC, id DESC
-             LIMIT ?2",
-            params![pattern, limit],
+    let fetch_limit = (limit + 1) as i64;
+    // rusqlite requires every named parameter to exist in both SQL variants.
+    // The NULL guard keeps `:key` present when the expression index uses LIKE.
+    let (prefix_clause, key) = if needle.chars().count() <= 64 {
+        (
+            ":key IS NULL AND substr(c.normalized_text, 1, 64) LIKE :pattern ESCAPE '\\'",
+            None,
         )
     } else {
-        let key: String = needle.chars().take(64).collect();
-        query_summaries(
-            connection,
-            "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
-                    c.payload_size, substr(c.normalized_text, 1, 256),
-                    EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
-             FROM clips AS c
-             WHERE substr(normalized_text, 1, 64) = ?1
-               AND normalized_text LIKE ?2 ESCAPE '\\'
-             ORDER BY last_used_at DESC, id DESC
-             LIMIT ?3",
-            params![key, pattern, limit],
+        (
+            "substr(c.normalized_text, 1, 64) = :key",
+            Some(needle.chars().take(64).collect::<String>()),
+        )
+    };
+    let sql = format!(
+        "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
+                c.payload_size, substr(c.normalized_text, 1, 256),
+                EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
+         FROM clips AS c
+         WHERE {prefix_clause}
+           AND c.normalized_text LIKE :pattern ESCAPE '\\'
+           AND {}
+         ORDER BY c.last_used_at {}, c.id {}
+         LIMIT :limit",
+        page.predicate("c"),
+        page.order,
+        page.order
+    );
+    let items = query_summaries(
+        connection,
+        &sql,
+        named_params! {
+            ":pattern": pattern,
+            ":key": key,
+            ":anchor_time": page.anchor.last_used_at_ms,
+            ":anchor_id": page.anchor.id.0,
+            ":limit": fetch_limit,
+        },
+    )?;
+    Ok(history_page(items, limit, page.reverse))
+}
+
+#[derive(Clone, Copy)]
+struct PageSql {
+    anchor: HistoryCursor,
+    comparison: &'static str,
+    order: &'static str,
+    reverse: bool,
+}
+
+impl PageSql {
+    fn new(cursor: Option<HistoryCursor>, direction: PageDirection) -> Result<Self, StoreError> {
+        match (cursor, direction) {
+            (None, PageDirection::Older) => Ok(Self {
+                anchor: HistoryCursor {
+                    last_used_at_ms: i64::MAX,
+                    id: ClipId(i64::MAX),
+                },
+                comparison: "<",
+                order: "DESC",
+                reverse: false,
+            }),
+            (Some(anchor), PageDirection::Older) => Ok(Self {
+                anchor,
+                comparison: "<",
+                order: "DESC",
+                reverse: false,
+            }),
+            (Some(anchor), PageDirection::Newer) => Ok(Self {
+                anchor,
+                comparison: ">",
+                order: "ASC",
+                reverse: true,
+            }),
+            (None, PageDirection::Newer) => Err(StoreError::InvalidData(
+                "newer page requests require an anchor",
+            )),
+        }
+    }
+
+    fn predicate(self, alias: &str) -> String {
+        format!(
+            "({alias}.last_used_at {comparison} :anchor_time OR \
+             ({alias}.last_used_at = :anchor_time AND {alias}.id {comparison} :anchor_id))",
+            comparison = self.comparison,
         )
     }
+}
+
+fn history_page(mut items: Vec<ClipSummary>, limit: usize, reverse: bool) -> HistoryPage {
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    if reverse {
+        items.reverse();
+    }
+    let continuation_cursor = has_more.then(|| {
+        let item = if reverse {
+            items.first().expect("a non-empty page with continuation")
+        } else {
+            items.last().expect("a non-empty page with continuation")
+        };
+        HistoryCursor {
+            last_used_at_ms: item.last_used_at_ms,
+            id: item.id,
+        }
+    });
+    HistoryPage {
+        items,
+        continuation_cursor,
+        has_more,
+        truncated: false,
+    }
+}
+
+fn recent_scan_boundary(
+    connection: &Connection,
+    page: PageSql,
+) -> Result<Option<HistoryCursor>, StoreError> {
+    let sql = format!(
+        "SELECT clips.last_used_at, clips.id
+         FROM clips
+         WHERE clips.normalized_text IS NOT NULL AND {}
+         ORDER BY clips.last_used_at {}, clips.id {}
+         LIMIT 1 OFFSET 1999",
+        page.predicate("clips"),
+        page.order,
+        page.order
+    );
+    connection
+        .query_row(
+            &sql,
+            named_params! {
+                ":anchor_time": page.anchor.last_used_at_ms,
+                ":anchor_id": page.anchor.id.0,
+            },
+            |row| {
+                Ok(HistoryCursor {
+                    last_used_at_ms: row.get(0)?,
+                    id: ClipId(row.get(1)?),
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 fn query_summaries<P: rusqlite::Params>(
@@ -455,6 +623,34 @@ mod tests {
         assert!(
             substring_plan.contains("VIRTUAL TABLE INDEX"),
             "FTS5 virtual index missing: {substring_plan}"
+        );
+
+        let recent_page_plan = explain(
+            &connection,
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM clips
+             WHERE last_used_at < ?1 OR (last_used_at = ?1 AND id < ?2)
+             ORDER BY last_used_at DESC, id DESC
+             LIMIT ?3",
+            params![1_000_i64, 500_i64, 51_i64],
+        );
+        assert!(
+            recent_page_plan.contains("idx_clips_recent"),
+            "recent keyset index missing: {recent_page_plan}"
+        );
+
+        let newer_page_plan = explain(
+            &connection,
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM clips
+             WHERE last_used_at > ?1 OR (last_used_at = ?1 AND id > ?2)
+             ORDER BY last_used_at ASC, id ASC
+             LIMIT ?3",
+            params![1_000_i64, 500_i64, 51_i64],
+        );
+        assert!(
+            newer_page_plan.contains("idx_clips_recent"),
+            "newer keyset index missing: {newer_page_plan}"
         );
     }
 

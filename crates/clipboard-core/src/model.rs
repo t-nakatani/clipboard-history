@@ -86,6 +86,30 @@ pub struct ClipSummary {
     pub has_image_preview: bool,
 }
 
+/// Stable seek position for history ordered by `(last_used_at, id) DESC`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistoryCursor {
+    pub last_used_at_ms: i64,
+    pub id: ClipId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageDirection {
+    Older,
+    Newer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryPage {
+    pub items: Vec<ClipSummary>,
+    /// Seek position for the next request in the same direction. This can be
+    /// beyond the last matching item when a bounded recent scan is truncated.
+    pub continuation_cursor: Option<HistoryCursor>,
+    pub has_more: bool,
+    /// The bounded scan reached its row budget before proving end-of-history.
+    pub truncated: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UpsertOutcome {
     pub id: ClipId,

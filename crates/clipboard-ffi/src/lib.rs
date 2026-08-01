@@ -32,6 +32,26 @@ pub struct ClipSummaryDto {
     pub has_image_preview: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct HistoryCursorDto {
+    pub last_used_at_ms: i64,
+    pub id: i64,
+}
+
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct HistoryPageDto {
+    pub items: Vec<ClipSummaryDto>,
+    pub continuation_cursor: Option<HistoryCursorDto>,
+    pub has_more: bool,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum PageDirectionDto {
+    Older,
+    Newer,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum SearchModeDto {
     Exact,
@@ -122,11 +142,25 @@ impl ClipboardEngine {
     }
 
     pub fn recent(&self, limit: u32) -> Result<Vec<ClipSummaryDto>, ClipboardFfiError> {
+        self.recent_page(None, PageDirectionDto::Older, limit)
+            .map(|page| page.items)
+    }
+
+    pub fn recent_page(
+        &self,
+        cursor: Option<HistoryCursorDto>,
+        direction: PageDirectionDto,
+        limit: u32,
+    ) -> Result<HistoryPageDto, ClipboardFfiError> {
         self.service
             .repository()
-            .recent(limit.clamp(1, 200) as usize)
+            .recent_page(
+                cursor.map(history_cursor),
+                page_direction(direction),
+                limit.clamp(1, 200) as usize,
+            )
             .map_err(store_error)
-            .map(|rows| rows.into_iter().map(clip_summary_dto).collect())
+            .map(history_page_dto)
     }
 
     pub fn delete(&self, id: i64) -> Result<bool, ClipboardFfiError> {
@@ -178,15 +212,33 @@ impl ClipboardEngine {
         mode: SearchModeDto,
         limit: u32,
     ) -> Result<Vec<ClipSummaryDto>, ClipboardFfiError> {
+        self.search_page(query, mode, None, PageDirectionDto::Older, limit)
+            .map(|page| page.items)
+    }
+
+    pub fn search_page(
+        &self,
+        query: String,
+        mode: SearchModeDto,
+        cursor: Option<HistoryCursorDto>,
+        direction: PageDirectionDto,
+        limit: u32,
+    ) -> Result<HistoryPageDto, ClipboardFfiError> {
         let mode = match mode {
             SearchModeDto::Exact => clipboard_core::MatchMode::Exact,
             SearchModeDto::Prefix => clipboard_core::MatchMode::Prefix,
             SearchModeDto::Substring => clipboard_core::MatchMode::Substring,
         };
         self.service
-            .search(&query, mode, limit.clamp(1, 200) as usize)
+            .search_page(
+                &query,
+                mode,
+                cursor.map(history_cursor),
+                page_direction(direction),
+                limit.clamp(1, 200) as usize,
+            )
             .map_err(store_error)
-            .map(|rows| rows.into_iter().map(clip_summary_dto).collect())
+            .map(history_page_dto)
     }
 }
 
@@ -200,6 +252,32 @@ fn clip_summary_dto(row: clipboard_core::ClipSummary) -> ClipSummaryDto {
         payload_size: row.payload_size,
         preview: row.preview,
         has_image_preview: row.has_image_preview,
+    }
+}
+
+fn history_cursor(cursor: HistoryCursorDto) -> clipboard_core::HistoryCursor {
+    clipboard_core::HistoryCursor {
+        last_used_at_ms: cursor.last_used_at_ms,
+        id: clipboard_core::ClipId(cursor.id),
+    }
+}
+
+fn page_direction(direction: PageDirectionDto) -> clipboard_core::PageDirection {
+    match direction {
+        PageDirectionDto::Older => clipboard_core::PageDirection::Older,
+        PageDirectionDto::Newer => clipboard_core::PageDirection::Newer,
+    }
+}
+
+fn history_page_dto(page: clipboard_core::HistoryPage) -> HistoryPageDto {
+    HistoryPageDto {
+        items: page.items.into_iter().map(clip_summary_dto).collect(),
+        continuation_cursor: page.continuation_cursor.map(|cursor| HistoryCursorDto {
+            last_used_at_ms: cursor.last_used_at_ms,
+            id: cursor.id.0,
+        }),
+        has_more: page.has_more,
+        truncated: page.truncated,
     }
 }
 
@@ -351,5 +429,80 @@ mod tests {
 
         drop(engine);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ffi_exposes_cursor_and_has_more_for_recent_and_search() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-ffi-page-test-{unique}"));
+        let engine = ClipboardEngine::open(
+            root.join("history.sqlite").to_string_lossy().into_owned(),
+            root.join("payloads").to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        for index in 0..5 {
+            engine
+                .capture(
+                    vec![RepresentationDto {
+                        uti: "public.utf8-plain-text".into(),
+                        bytes: format!("page-{index}").into_bytes(),
+                    }],
+                    None,
+                    10 - index,
+                )
+                .unwrap();
+        }
+
+        let first = engine
+            .recent_page(None, PageDirectionDto::Older, 2)
+            .unwrap();
+        assert_eq!(first.items.len(), 2);
+        assert!(first.has_more);
+        assert!(!first.truncated);
+        let second = engine
+            .recent_page(first.continuation_cursor, PageDirectionDto::Older, 2)
+            .unwrap();
+        assert_eq!(second.items.len(), 2);
+        assert!(second.has_more);
+        let final_page = engine
+            .recent_page(second.continuation_cursor, PageDirectionDto::Older, 2)
+            .unwrap();
+        assert_eq!(final_page.items.len(), 1);
+        assert!(!final_page.has_more);
+
+        let newer = engine
+            .recent_page(
+                final_page.items.first().map(dto_cursor),
+                PageDirectionDto::Newer,
+                2,
+            )
+            .unwrap();
+        assert_eq!(newer.items.len(), 2);
+        assert!(newer.has_more);
+
+        let search = engine
+            .search_page(
+                "page-".into(),
+                SearchModeDto::Prefix,
+                None,
+                PageDirectionDto::Older,
+                2,
+            )
+            .unwrap();
+        assert_eq!(search.items.len(), 2);
+        assert!(search.has_more);
+
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn dto_cursor(item: &ClipSummaryDto) -> HistoryCursorDto {
+        HistoryCursorDto {
+            last_used_at_ms: item.last_used_at_ms,
+            id: item.id,
+        }
     }
 }

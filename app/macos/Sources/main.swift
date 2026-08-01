@@ -22,6 +22,123 @@ func runBindingSelfTest() -> Int32 {
         return 1
     }
 
+    var pageWindow = HistoryPageWindow(maximumCount: 200)
+    for pageIndex in 0 ..< 5 {
+        let start = pageIndex * 50
+        let items = (start ..< start + 50).map { value in
+            ClipSummaryDto(
+                id: Int64(value),
+                kind: "text",
+                lastUsedAtMs: Int64(1_000 - value),
+                pinned: false,
+                copyCount: 1,
+                payloadSize: 1,
+                preview: "item-\(value)",
+                hasImagePreview: false
+            )
+        }
+        let page = HistoryPageDto(
+            items: items,
+            continuationCursor: pageIndex < 4
+                ? HistoryCursorDto(
+                    lastUsedAtMs: Int64(1_000 - (start + 49)),
+                    id: Int64(start + 49)
+                )
+                : nil,
+            hasMore: pageIndex < 4,
+            truncated: false
+        )
+        if pageIndex == 0 {
+            pageWindow.reset(with: page)
+        } else {
+            pageWindow.appendOlder(page)
+        }
+    }
+    guard
+        pageWindow.rows.count == 200,
+        pageWindow.rows.first?.id == 50,
+        pageWindow.rows.last?.id == 249,
+        !pageWindow.hasMoreOlder,
+        pageWindow.hasMoreNewer
+    else {
+        fputs("bounded history page window did not evict the oldest loaded page\n", stderr)
+        return 1
+    }
+
+    let newestItems = (0 ..< 50).map { value in
+        ClipSummaryDto(
+            id: Int64(value),
+            kind: "text",
+            lastUsedAtMs: Int64(1_000 - value),
+            pinned: false,
+            copyCount: 1,
+            payloadSize: 1,
+            preview: "item-\(value)",
+            hasImagePreview: false
+        )
+    }
+    pageWindow.prependNewer(
+        HistoryPageDto(
+            items: newestItems,
+            continuationCursor: nil,
+            hasMore: false,
+            truncated: false
+        )
+    )
+    guard
+        pageWindow.rows.count == 200,
+        pageWindow.rows.first?.id == 0,
+        pageWindow.rows.last?.id == 199,
+        !pageWindow.hasMoreNewer,
+        pageWindow.hasMoreOlder
+    else {
+        fputs("bounded history page window could not return to newer pages\n", stderr)
+        return 1
+    }
+
+    let recopied = ClipSummaryDto(
+        id: 150,
+        kind: "text",
+        lastUsedAtMs: 2_000,
+        pinned: false,
+        copyCount: 2,
+        payloadSize: 1,
+        preview: "item-150",
+        hasImagePreview: false
+    )
+    pageWindow.prependNewer(
+        HistoryPageDto(
+            items: [recopied],
+            continuationCursor: nil,
+            hasMore: false,
+            truncated: false
+        )
+    )
+    guard
+        pageWindow.rows.count == 200,
+        pageWindow.rows.first?.id == 150,
+        pageWindow.rows.first?.copyCount == 2,
+        pageWindow.rows.filter({ $0.id == 150 }).count == 1
+    else {
+        fputs("recopied row was not moved to its new position\n", stderr)
+        return 1
+    }
+
+    var scanWindow = HistoryPageWindow(maximumCount: 200)
+    let scanCursor = HistoryCursorDto(lastUsedAtMs: 500, id: 500)
+    scanWindow.reset(
+        with: HistoryPageDto(
+            items: [],
+            continuationCursor: scanCursor,
+            hasMore: true,
+            truncated: true
+        )
+    )
+    guard scanWindow.hasMoreOlder, scanWindow.olderAnchor == scanCursor else {
+        fputs("truncated empty scan lost its continuation cursor\n", stderr)
+        return 1
+    }
+
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("clipboard-swift-self-test-\(UUID().uuidString)", isDirectory: true)
     do {
