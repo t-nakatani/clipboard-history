@@ -9,6 +9,9 @@ use crate::StoreError;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Chunk size used when hashing an existing payload for verification.
+const VERIFY_CHUNK_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PayloadHash(pub [u8; 32]);
 
@@ -182,7 +185,11 @@ fn open_payload_file(path: &Path) -> Result<File, StoreError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        // O_NOFOLLOW rejects a symlink at the final component; O_NONBLOCK keeps
+        // a FIFO planted at the payload path from blocking the open until a
+        // writer appears. Regular file reads are unaffected by O_NONBLOCK, and
+        // the FIFO is rejected by the regular-file check after the open.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(not(unix))]
     {
@@ -200,16 +207,15 @@ fn open_payload_file(path: &Path) -> Result<File, StoreError> {
     }
 }
 
-/// Reads and validates the payload stored at `path`.
-///
-/// The read is bounded by the size reported by the opened file, which is
-/// itself rejected when it exceeds `max_bytes`, so a large file on disk can
-/// never cause a large allocation.
-fn read_verified(path: &Path, hash: PayloadHash, max_bytes: u64) -> Result<Vec<u8>, StoreError> {
+/// Opens a payload file and rejects it unless it is a regular file no larger
+/// than `max_bytes`. Returns the opened file and its size.
+fn open_validated(path: &Path, max_bytes: u64) -> Result<(File, u64), StoreError> {
     let file = open_payload_file(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
-        return Err(StoreError::InvalidData("payload path is not a regular file"));
+        return Err(StoreError::InvalidData(
+            "payload path is not a regular file",
+        ));
     }
     let size = metadata.len();
     if size > max_bytes {
@@ -217,12 +223,23 @@ fn read_verified(path: &Path, hash: PayloadHash, max_bytes: u64) -> Result<Vec<u
             "payload exceeds the configured restore byte limit",
         ));
     }
+    Ok((file, size))
+}
 
+/// Reads and validates the payload stored at `path`.
+///
+/// The read is bounded by the size reported by the opened file, which is
+/// itself rejected when it exceeds `max_bytes`, so a large file on disk can
+/// never cause a large allocation.
+fn read_verified(path: &Path, hash: PayloadHash, max_bytes: u64) -> Result<Vec<u8>, StoreError> {
+    let (file, size) = open_validated(path, max_bytes)?;
     let mut bytes = Vec::with_capacity(size as usize);
     let mut reader = file.take(size);
     reader.read_to_end(&mut bytes)?;
     if bytes.len() as u64 != size {
-        return Err(StoreError::InvalidData("payload changed size while reading"));
+        return Err(StoreError::InvalidData(
+            "payload changed size while reading",
+        ));
     }
     if PayloadHash::of(&bytes) != hash {
         return Err(StoreError::InvalidData(
@@ -232,13 +249,50 @@ fn read_verified(path: &Path, hash: PayloadHash, max_bytes: u64) -> Result<Vec<u
     Ok(bytes)
 }
 
+/// Validates the payload stored at `path` without buffering it.
+///
+/// The file is hashed in fixed-size chunks, so verifying an existing payload
+/// never allocates proportionally to its size.
+fn verify_stored(path: &Path, hash: PayloadHash, expected_size: u64) -> Result<(), StoreError> {
+    let (file, size) = open_validated(path, expected_size)?;
+    if size != expected_size {
+        return Err(StoreError::InvalidData(
+            "payload size does not match the expected size",
+        ));
+    }
+
+    let mut reader = file.take(size);
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; VERIFY_CHUNK_BYTES.min(size.max(1) as usize)];
+    let mut total = 0_u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        total += read as u64;
+    }
+    if total != size {
+        return Err(StoreError::InvalidData(
+            "payload changed size while reading",
+        ));
+    }
+    if PayloadHash(*hasher.finalize().as_bytes()) != hash {
+        return Err(StoreError::InvalidData(
+            "payload failed integrity verification",
+        ));
+    }
+    Ok(())
+}
+
 /// Returns `true` when a valid payload for `hash` already exists at `path`.
 ///
 /// A missing file is reported as `false`; a file that fails validation is also
 /// reported as `false` so the caller rewrites it from trusted bytes.
-fn verify_file(path: &Path, hash: PayloadHash, max_bytes: u64) -> Result<bool, StoreError> {
-    match read_verified(path, hash, max_bytes) {
-        Ok(_) => Ok(true),
+fn verify_file(path: &Path, hash: PayloadHash, expected_size: u64) -> Result<bool, StoreError> {
+    match verify_stored(path, hash, expected_size) {
+        Ok(()) => Ok(true),
         Err(StoreError::InvalidData(_)) => Ok(false),
         Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
@@ -348,6 +402,28 @@ mod tests {
         std::os::unix::fs::symlink(&target, &stored.path).unwrap();
 
         assert_invalid(store.read(stored.hash, LIMIT).unwrap_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_rejects_fifo_at_payload_path_without_blocking() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let root = temp_root("fifo");
+        let store = PayloadStore::new(&root);
+        let stored = store.put(b"payload").unwrap();
+        fs::remove_file(&stored.path).unwrap();
+        let raw = CString::new(stored.path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `raw` is a valid NUL-terminated path owned by this test.
+        assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+
+        // Without O_NONBLOCK this open would block until a writer appears.
+        assert_invalid(store.read(stored.hash, LIMIT).unwrap_err());
+
+        let again = store.put(b"payload").unwrap();
+        assert!(again.created);
+        assert_eq!(store.read(stored.hash, LIMIT).unwrap(), b"payload");
         fs::remove_dir_all(root).unwrap();
     }
 
