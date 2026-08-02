@@ -54,6 +54,7 @@ rust_dylib_id=$(/usr/bin/otool -D "$project_dir/target/release/libclipboard_ffi.
     "$script_dir/Sources/HistoryPageWindow.swift" \
     "$script_dir/Sources/HistoryFeedModel.swift" \
     "$script_dir/Sources/HistoryStatus.swift" \
+    "$script_dir/Sources/HistoryStatusView.swift" \
     "$script_dir/Sources/HistoryStore.swift" \
     "$script_dir/Sources/HistoryStoreClient.swift" \
     "$script_dir/Sources/ImagePreviewLoader.swift" \

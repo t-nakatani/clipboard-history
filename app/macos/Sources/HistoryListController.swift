@@ -23,6 +23,7 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
     private let configuration: HistoryPanelConfiguration
     private let feed: HistoryFeedModel
     private let previewLoader: ImagePreviewLoader
+    private let statusView: HistoryStatusView
     private let tableView = HistoryTableView()
     private let searchModeControl = NSSegmentedControl(
         labels: ["完全", "前方", "部分"],
@@ -36,11 +37,13 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         configuration: HistoryPanelConfiguration,
         feed: HistoryFeedModel,
         previewLoader: ImagePreviewLoader,
+        statusView: HistoryStatusView,
         contentFrame: NSRect
     ) {
         self.configuration = configuration
         self.feed = feed
         self.previewLoader = previewLoader
+        self.statusView = statusView
         contentView = TranslucentPanelContentView(
             frame: contentFrame,
             configuration: configuration
@@ -136,7 +139,7 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         )
         historyClipView = scrollView.contentView
 
-        let stack = NSStackView(views: [searchBar, scrollView])
+        let stack = NSStackView(views: [searchBar, scrollView, statusView])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = configuration.content.sectionSpacing
@@ -163,6 +166,10 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
             scrollView.widthAnchor.constraint(equalTo: stack.widthAnchor),
             scrollView.heightAnchor.constraint(
                 greaterThanOrEqualToConstant: configuration.content.minimumHistoryHeight
+            ),
+            statusView.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            statusView.heightAnchor.constraint(
+                equalToConstant: configuration.content.statusRowHeight
             ),
         ])
     }

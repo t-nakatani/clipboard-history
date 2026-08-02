@@ -501,17 +501,117 @@ func runHistoryFeedSelfTest() -> Int32 {
     var recoveryStatuses: [HistoryStatus] = []
     recoveryFeed.statusDidChange = { recoveryStatuses.append($0) }
     recoveryFeed.reload(keepingDetail: true)
-    guard case let .loaded(count, newestPreview)? = recoveryStatuses.last,
-          count == 3,
-          newestPreview == nil
+    guard case .loaded(3, _, _)? = recoveryStatuses.last,
+          recoveryStatuses.last?.headline != nil,
+          recoveryStatuses.last?.detail == nil
     else {
         fputs("a load asked to keep the detail line still described the newest row\n", stderr)
         return 1
     }
     recoveryStatuses.removeAll()
     recoveryFeed.reload()
-    guard case let .loaded(_, ordinaryPreview)? = recoveryStatuses.last, ordinaryPreview != nil else {
+    guard recoveryStatuses.last?.detail != nil else {
         fputs("an ordinary load stopped describing the newest row\n", stderr)
+        return 1
+    }
+
+    return 0
+}
+
+// MARK: - Status row
+
+/// The status row is inside the panel, which is closed most of the time. An
+/// important message raised then has to still be there when the panel opens.
+func runStatusRowSelfTest() -> Int32 {
+    let closedRow = HistoryStatusView(configuration: .standard)
+    closedRow.isOnScreen = { false }
+
+    closedRow.show(.recoveryRebuilt(quarantinePath: "/tmp/quarantine"))
+    let rebuiltHeadline = closedRow.displayedHeadline
+    closedRow.show(.captured(inserted: true, residentCount: 3))
+    closedRow.show(.loaded(count: 3, newestPreview: "item-3", keepsDetail: false))
+    guard closedRow.displayedHeadline == rebuiltHeadline else {
+        fputs("routine chatter buried the rebuild notice before the panel opened\n", stderr)
+        return 1
+    }
+
+    // Opening the panel delivers it, and the row goes back to normal.
+    closedRow.markSeen()
+    closedRow.show(.loaded(count: 3, newestPreview: "item-3", keepsDetail: false))
+    guard closedRow.displayedHeadline != rebuiltHeadline else {
+        fputs("the rebuild notice kept the row after the panel showed it\n", stderr)
+        return 1
+    }
+
+    // With the panel already open there is nothing to hold back.
+    let openRow = HistoryStatusView(configuration: .standard)
+    openRow.isOnScreen = { true }
+    openRow.show(.recoveryRebuilt(quarantinePath: nil))
+    let seenHeadline = openRow.displayedHeadline
+    openRow.show(.loaded(count: 0, newestPreview: nil, keepsDetail: false))
+    guard openRow.displayedHeadline != seenHeadline else {
+        fputs("an important status seen on an open panel still blocked later updates\n", stderr)
+        return 1
+    }
+
+    return layoutStatusRow()
+}
+
+/// Lays the panel contents out at the configured minimum size and checks that
+/// the new footer fits: the point of the row is to be readable, and a row that
+/// is clipped or overlapped by the headline is no better than the invisible
+/// labels it replaces.
+private func layoutStatusRow() -> Int32 {
+    let configuration = HistoryPanelConfiguration.standard
+    let statusView = HistoryStatusView(configuration: configuration)
+    let feed = HistoryFeedModel(onStoreActivity: {})
+    let frame = NSRect(
+        x: 0,
+        y: 0,
+        width: configuration.window.width,
+        height: configuration.window.minimumHeight
+    )
+    let controller = HistoryListController(
+        configuration: configuration,
+        feed: feed,
+        previewLoader: ImagePreviewLoader(fetch: feed.imagePreview),
+        statusView: statusView,
+        contentFrame: frame
+    )
+    // A long path is the worst case: it is what a rebuilt database reports.
+    statusView.show(.recoveryRebuilt(quarantinePath: String(repeating: "/quarantine", count: 24)))
+    controller.contentView.frame = frame
+    controller.contentView.layoutSubtreeIfNeeded()
+
+    guard statusView.frame.height == configuration.content.statusRowHeight else {
+        fputs("the status row did not get the height the panel geometry reserves for it\n", stderr)
+        return 1
+    }
+    // The labels were configured but never added to a view hierarchy before
+    // this change, so the first thing to establish is that the row is really
+    // inside the panel.
+    let rowInContent = statusView.convert(statusView.bounds, to: controller.contentView)
+    guard controller.contentView.bounds.contains(rowInContent) else {
+        fputs("the status row fell outside the panel at its minimum height\n", stderr)
+        return 1
+    }
+    guard let headlineView = statusView.arrangedSubviews.first,
+          let detailView = statusView.arrangedSubviews.last,
+          headlineView !== detailView
+    else {
+        fputs("the status row lost one of its labels\n", stderr)
+        return 1
+    }
+    // Label frames overhang their alignment rects by the text field's bezel
+    // inset, so the laid-out text is what has to fit, not the frame.
+    let headlineRect = headlineView.alignmentRect(forFrame: headlineView.frame)
+    let detailRect = detailView.alignmentRect(forFrame: detailView.frame)
+    guard headlineRect.maxX <= detailRect.minX else {
+        fputs("the headline and the detail line overlap in the status row\n", stderr)
+        return 1
+    }
+    guard detailRect.maxX <= statusView.bounds.width else {
+        fputs("the detail line ran past the width of the panel\n", stderr)
         return 1
     }
 
@@ -522,6 +622,7 @@ func runSelfTest() -> Int32 {
     let stages: [(String, () -> Int32)] = [
         ("bindings", runBindingSelfTest),
         ("history feed", runHistoryFeedSelfTest),
+        ("status row", runStatusRowSelfTest),
     ]
     for (name, stage) in stages {
         let status = stage()

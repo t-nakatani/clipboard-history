@@ -19,12 +19,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var listController: HistoryListController?
     private var feed: HistoryFeedModel?
 
-    private let statusLabel = NSTextField(labelWithString: "コピー待機中")
-    private let detailLabel = NSTextField(wrappingLabelWithString: "型一覧の検査後、許可されたpayloadだけを読み取ります。")
+    private lazy var statusView = HistoryStatusView(configuration: uiConfiguration)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureStatusItem()
-        configureStatusLabels()
 
         // The panel is built before the store opens so the menu bar item stays
         // usable throughout startup, and still responds if the store never
@@ -114,11 +112,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             switch result {
             case let .success(report):
                 if report.databaseRebuilt {
+                    NSLog(
+                        "Clipboard History rebuilt a corrupted database; previous history quarantined at %@",
+                        report.quarantinePath ?? "(unknown path)"
+                    )
                     self.show(.recoveryRebuilt(quarantinePath: report.quarantinePath))
                 } else {
                     let reclaimed = report.garbageCollection.payloadFilesDeleted
                         + report.garbageCollection.orphanFilesDeleted
                         + report.garbageCollection.stagedFilesDeleted
+                    NSLog("Clipboard History startup recovery reclaimed %llu orphaned files", reclaimed)
                     self.show(.recoveryCompleted(reclaimedFiles: reclaimed))
                 }
             case let .failure(error):
@@ -128,9 +131,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSLog("Clipboard History startup recovery failed: %@", error.localizedDescription)
                 self.show(.recoveryFailed(error.localizedDescription))
             }
-            // The recovery cases carry no headline, so the load owns it. The
-            // detail is the outcome, and the load is asked to leave it alone;
-            // the preview it would have shown returns with the next action.
+            // A completed recovery carries no headline, so the load owns it,
+            // and the outcome is on the detail line the load is asked to leave
+            // alone. A rebuild or a failure is important and owns both lines;
+            // the load's routine status cannot displace it. Either way the
+            // preview comes back with the next thing the user does.
             feed.reload(keepingDetail: true)
         }
     }
@@ -185,12 +190,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let panel = HistoryPanel(configuration: uiConfiguration)
         panel.visibilityDidChange = { [weak self] visible in
             self?.statusItem?.button?.highlight(visible)
+            // The row is in front of the user now, so an important status has
+            // been delivered and routine updates may take it back over.
+            if visible { self?.statusView.markSeen() }
         }
+        statusView.isOnScreen = { [weak panel] in panel?.isVisible ?? false }
 
         let listController = HistoryListController(
             configuration: uiConfiguration,
             feed: feed,
             previewLoader: previewLoader,
+            statusView: statusView,
             contentFrame: panel.contentRect(forFrameRect: panel.frame)
         )
         listController.statusDidChange = { [weak self] status in self?.show(status) }
@@ -203,19 +213,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Status presentation
 
-    private func configureStatusLabels() {
-        statusLabel.font = .systemFont(ofSize: uiConfiguration.typography.statusSize, weight: .semibold)
-        detailLabel.textColor = .secondaryLabelColor
-        detailLabel.font = .systemFont(ofSize: uiConfiguration.typography.detailSize)
-        detailLabel.maximumNumberOfLines = 2
-    }
-
     private func show(_ status: HistoryStatus) {
-        if let headline = status.headline {
-            statusLabel.stringValue = headline
+        // The row lives in a panel the user may never open, so a storage
+        // failure is also written where it can be found afterwards. The other
+        // important cases log at the point they are detected.
+        if case let .failed(error) = status {
+            NSLog("Clipboard History storage error: %@", error.localizedDescription)
         }
-        if let detail = status.detail {
-            detailLabel.stringValue = detail
-        }
+        statusView.show(status)
     }
 }
