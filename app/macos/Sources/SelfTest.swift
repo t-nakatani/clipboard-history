@@ -440,6 +440,37 @@ func runHistoryFeedSelfTest() -> Int32 {
         return 1
     }
 
+    // The row-update bracket has to wrap the change: the view reads the rows it
+    // is showing before `apply` and the replacements after, which is what lets
+    // it put the reader back where they were.
+    let bracketStore = StubHistoryStore(
+        recentPageResult: fixturePage(ids: [2, 1]),
+        searchPageResult: fixturePage(ids: [])
+    )
+    let bracketFeed = HistoryFeedModel(store: bracketStore, onStoreActivity: {})
+    var bracketObservations: [[Int64]] = []
+    bracketFeed.updateRows = { [weak bracketFeed] _, apply in
+        bracketObservations.append(bracketFeed?.rows.map(\.id) ?? [])
+        apply()
+        bracketObservations.append(bracketFeed?.rows.map(\.id) ?? [])
+    }
+    bracketFeed.reload()
+    guard bracketObservations == [[], [2, 1]] else {
+        fputs("row update bracket did not wrap the change to the resident rows\n", stderr)
+        return 1
+    }
+
+    // The panel is usable before the store opens, so a restore attempted then
+    // has to come back as a failure rather than drop the completion and leave
+    // the caller showing progress forever.
+    let detachedFeed = HistoryFeedModel(onStoreActivity: {})
+    var detachedRestore: Result<[RepresentationDto], Error>?
+    detachedFeed.representations(for: 1) { detachedRestore = $0 }
+    guard let detachedRestore, case .failure = detachedRestore else {
+        fputs("a restore before the store opened did not complete\n", stderr)
+        return 1
+    }
+
     return 0
 }
 
