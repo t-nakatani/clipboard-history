@@ -35,14 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         feed.statusDidChange = { [weak self] status in self?.show(status) }
         self.feed = feed
 
-        let previewLoader = ImagePreviewLoader { [weak feed] id, completion in
-            guard let feed else {
-                completion(nil)
-                return
-            }
-            feed.imagePreview(id: id, completion: completion)
-        }
-        configurePanel(feed: feed, previewLoader: previewLoader)
+        configurePanel(feed: feed, previewLoader: ImagePreviewLoader(fetch: feed.imagePreview))
 
         show(.preparingStorage)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -197,33 +190,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             previewLoader: previewLoader,
             contentFrame: panel.contentRect(forFrameRect: panel.frame)
         )
-        listController.restoreRequested = { [weak self] summary in
-            self?.restore(summary)
-        }
+        listController.statusDidChange = { [weak self] status in self?.show(status) }
+        listController.dismissPanel = { [weak panel] in panel?.dismiss() }
         panel.contentView = listController.contentView
-
-        // A capture only holds back the newest rows when the user can actually
-        // see them, which is the one part of the policy that needs the panel.
-        feed.shouldHoldNewestUpdate = { [weak panel, weak listController] in
-            panel?.isVisible == true && listController?.isViewingAwayFromNewest == true
-        }
 
         self.panel = panel
         self.listController = listController
-    }
-
-    private func restore(_ summary: ClipSummaryDto) {
-        guard let feed else { return }
-        show(.restoring)
-        feed.representations(for: summary.id) { [weak self] result in
-            do {
-                try PasteboardWriter.restore(representations: try result.get())
-                self?.show(.restored(preview: summary.preview ?? summary.kind))
-                self?.panel?.dismiss()
-            } catch {
-                self?.show(.failed(error))
-            }
-        }
     }
 
     // MARK: - Status presentation

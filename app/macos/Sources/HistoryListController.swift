@@ -13,9 +13,12 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
     let contentView: TranslucentPanelContentView
     let searchField = NSSearchField()
 
-    /// Asks the owner to put this clip back on the pasteboard. Restoring needs
-    /// to dismiss the panel too, which is the owner's decision to make.
-    var restoreRequested: ((ClipSummaryDto) -> Void)?
+    /// Reports what the list is doing so the owner can present it. Restoring is
+    /// driven from here, so its outcome does not reach the feed.
+    var statusDidChange: ((HistoryStatus) -> Void)?
+    /// A restored clip is the panel's cue to go away. Whoever owns the panel
+    /// decides how that happens.
+    var dismissPanel: (() -> Void)?
 
     private let configuration: HistoryPanelConfiguration
     private let feed: HistoryFeedModel
@@ -28,8 +31,6 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         action: nil
     )
     private weak var historyClipView: NSClipView?
-    private var pendingAnchor: (id: Int64, offset: CGFloat)?
-    private var pendingSelectedId: Int64?
 
     init(
         configuration: HistoryPanelConfiguration,
@@ -47,19 +48,25 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         super.init()
         buildContents()
         previewLoader.didLoad = { [weak self] id in self?.redrawRow(id: id) }
-        feed.willChangeRows = { [weak self] reset in self?.beginRowUpdate(reset: reset) }
-        feed.didChangeRows = { [weak self] reset in self?.endRowUpdate(reset: reset) }
-        // `shouldHoldNewestUpdate` also depends on whether the panel is on
-        // screen, which only the owner knows, so it is wired there.
+        feed.updateRows = { [weak self] reset, apply in
+            guard let self else {
+                apply()
+                return
+            }
+            self.updateRows(reset: reset, apply: apply)
+        }
+        feed.shouldHoldNewestUpdate = { [weak self] in self?.shouldHoldNewestUpdate ?? false }
     }
 
     deinit {
         NotificationCenter.default.removeObserver(self)
     }
 
-    /// True while the newest clip would not be on screen anyway, so a capture
-    /// can be announced instead of yanking the rows out from under the reader.
-    var isViewingAwayFromNewest: Bool {
+    /// True while a freshly captured clip would not be visible anyway: either
+    /// the panel is off screen, or the reader has scrolled away from the newest
+    /// rows and should not have them yanked out from under them.
+    private var shouldHoldNewestUpdate: Bool {
+        guard contentView.window?.isVisible == true else { return false }
         if feed.hasMoreNewer { return true }
         let visibleRows = tableView.rows(in: tableView.visibleRect)
         return visibleRows.location != NSNotFound
@@ -172,7 +179,16 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
 
     @objc private func restoreSelected() {
         guard let summary = selectedSummary else { return }
-        restoreRequested?(summary)
+        statusDidChange?(.restoring)
+        feed.representations(for: summary.id) { [weak self] result in
+            do {
+                try PasteboardWriter.restore(representations: try result.get())
+                self?.statusDidChange?(.restored(preview: summary.preview ?? summary.kind))
+                self?.dismissPanel?()
+            } catch {
+                self?.statusDidChange?(.failed(error))
+            }
+        }
     }
 
     @objc private func deleteSelected() {
@@ -202,16 +218,13 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
 
     // MARK: - Row updates
 
-    private func beginRowUpdate(reset: Bool) {
-        pendingAnchor = reset ? nil : visibleAnchor()
-        pendingSelectedId = selectedSummary?.id
-    }
+    /// Keeps the reader's place across a row change: where the viewport sits and
+    /// what is selected are read before the mutation and put back after it.
+    private func updateRows(reset: Bool, apply: () -> Void) {
+        let anchor = reset ? nil : visibleAnchor()
+        let selectedId = selectedSummary?.id
 
-    private func endRowUpdate(reset: Bool) {
-        let anchor = pendingAnchor
-        let selectedId = pendingSelectedId
-        pendingAnchor = nil
-        pendingSelectedId = nil
+        apply()
 
         tableView.reloadData()
         if let selectedId, let row = feed.rows.firstIndex(where: { $0.id == selectedId }) {

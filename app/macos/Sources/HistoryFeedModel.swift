@@ -35,10 +35,10 @@ final class HistoryFeedModel {
     /// Answers whether a newly captured clip should stay off screen because the
     /// user is reading older rows. Absent, the feed always jumps to newest.
     var shouldHoldNewestUpdate: (() -> Bool)?
-    /// Bracket the row mutation so the view can preserve scroll position and
-    /// selection across it. `reset` is true when the whole window is replaced.
-    var willChangeRows: ((_ reset: Bool) -> Void)?
-    var didChangeRows: ((_ reset: Bool) -> Void)?
+    /// Wraps a row mutation so the view can keep scroll position and selection
+    /// steady across it. `reset` is true when the whole window is replaced, and
+    /// `apply` performs the mutation. Unset, the mutation simply runs.
+    var updateRows: ((_ reset: Bool, _ apply: () -> Void) -> Void)?
     var statusDidChange: ((HistoryStatus) -> Void)?
 
     var rows: [ClipSummaryDto] { window.rows }
@@ -110,12 +110,13 @@ final class HistoryFeedModel {
     /// Runs a query change immediately, bypassing the debounce.
     func search(text: String, mode: SearchModeDto) {
         cancelPendingSearch()
-        markActivity()
-        generation += 1
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            // `loadRecent` records the activity and takes the next generation.
             loadRecent()
             return
         }
+        markActivity()
+        generation += 1
         guard let store else { return }
         query = .search(text: text, mode: mode)
         let issued = generation
@@ -238,11 +239,17 @@ final class HistoryFeedModel {
         }
     }
 
+    /// Reads back everything needed to put a clip on the pasteboard. The caller
+    /// shows progress while this runs, so a missing store has to complete with a
+    /// failure rather than leave that progress on screen forever.
     func representations(
         for id: Int64,
         completion: @escaping (Result<[RepresentationDto], Error>) -> Void
     ) {
-        guard let store else { return }
+        guard let store else {
+            completion(.failure(HistoryStoreUnavailableError()))
+            return
+        }
         markActivity()
         store.select(id: id, completion: completion)
     }
@@ -310,15 +317,20 @@ final class HistoryFeedModel {
         reset: Bool,
         direction: PageDirectionDto = .older
     ) {
-        willChangeRows?(reset)
-        if reset {
-            window.reset(with: page)
-        } else {
-            switch direction {
-            case .older: window.appendOlder(page)
-            case .newer: window.prependNewer(page)
+        let mutate = {
+            if reset {
+                self.window.reset(with: page)
+            } else {
+                switch direction {
+                case .older: self.window.appendOlder(page)
+                case .newer: self.window.prependNewer(page)
+                }
             }
         }
-        didChangeRows?(reset)
+        guard let updateRows else {
+            mutate()
+            return
+        }
+        updateRows(reset, mutate)
     }
 }

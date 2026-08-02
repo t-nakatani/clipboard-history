@@ -1,11 +1,21 @@
 import Foundation
 
+/// Reported when the feed is asked for data before the store has opened. The
+/// panel is usable during startup, so calls can arrive with nowhere to go.
+struct HistoryStoreUnavailableError: LocalizedError {
+    var errorDescription: String? { "ストレージの準備が完了していません" }
+}
+
 /// Every store call the history feed makes.
 ///
 /// `HistoryStoreClient` is the production implementation. The protocol exists so
 /// the feed's paging and refresh policy can be exercised against a stub, since
 /// the real client resolves its own paths under Application Support and cannot
 /// be pointed at a scratch directory.
+///
+/// Every completion runs on the main queue. Rows, the image preview cache and
+/// the table view are all touched from those completions without further
+/// synchronisation, so a stub has to honour this too.
 protocol HistoryStore: AnyObject {
     func capture(
         representations: [RepresentationDto],
