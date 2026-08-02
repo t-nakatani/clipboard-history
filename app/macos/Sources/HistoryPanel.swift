@@ -44,9 +44,51 @@ final class TranslucentPanelContentView: NSView {
     }
 }
 
+/// Rows of the history list highlight like a menu: the selection follows the
+/// pointer and stays accent-coloured even though the search field, not the
+/// table, holds first responder.
+final class HistoryRowView: NSTableRowView {
+    override var isEmphasized: Bool {
+        get { true }
+        set { _ = newValue }
+    }
+}
+
 final class HistoryTableView: NSTableView {
     var confirmSelection: (() -> Void)?
     var deleteSelection: (() -> Void)?
+
+    private var hoverTrackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTrackingArea {
+            removeTrackingArea(hoverTrackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        selectRow(under: event)
+    }
+
+    /// Moves the selection to whatever row sits under the pointer. Rows outside
+    /// the list keep the current selection so the panel never ends up with
+    /// nothing to restore.
+    private func selectRow(under event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let row = self.row(at: point)
+        guard row >= 0, row != selectedRow else { return }
+        selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+    }
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 36 || event.keyCode == 76 {
@@ -96,6 +138,9 @@ final class HistoryPanel: NSPanel {
         isMovable = false
         isMovableByWindowBackground = false
         hidesOnDeactivate = true
+        // The history list highlights the row under the pointer, which needs
+        // mouse-moved events to reach its tracking area.
+        acceptsMouseMovedEvents = true
         animationBehavior = .utilityWindow
     }
 

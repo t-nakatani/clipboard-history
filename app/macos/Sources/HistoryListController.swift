@@ -120,7 +120,7 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         tableView.dataSource = self
         tableView.delegate = self
         tableView.target = self
-        tableView.doubleAction = #selector(restoreSelected)
+        tableView.action = #selector(restoreClicked)
         tableView.confirmSelection = { [weak self] in self?.restoreSelected() }
         tableView.deleteSelection = { [weak self] in self?.deleteSelected() }
 
@@ -182,6 +182,13 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
 
     func controlTextDidChange(_ notification: Notification) {
         feed.scheduleSearch(text: searchField.stringValue, mode: selectedSearchMode)
+    }
+
+    /// A single click restores the row it landed on. Clicks in the empty area
+    /// below the last row report no row and are ignored.
+    @objc private func restoreClicked() {
+        guard tableView.clickedRow >= 0 else { return }
+        restoreSelected()
     }
 
     @objc private func restoreSelected() {
@@ -285,6 +292,16 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         feed.rows[row].hasImagePreview
             ? configuration.rows.imageHeight
             : configuration.rows.textHeight
+    }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let identifier = NSUserInterfaceItemIdentifier("HistoryRow")
+        if let reused = tableView.makeView(withIdentifier: identifier, owner: self) as? HistoryRowView {
+            return reused
+        }
+        let rowView = HistoryRowView()
+        rowView.identifier = identifier
+        return rowView
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
