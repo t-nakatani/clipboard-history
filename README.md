@@ -32,7 +32,7 @@
 - Swift専用serial queueからRust store actorを呼ぶ非同期境界
 - 1クリックで開く半透明のAppKit panel
 - text/image別のrow heightと画像thumbnail
-- Returnで復元、Delete/Backspaceで削除
+- ホバーで行を選択、シングルクリックまたはReturnで復元、検索欄が空のときのDelete/Backspaceで削除
 
 ### 現在の制約
 

@@ -44,20 +44,80 @@ final class TranslucentPanelContentView: NSView {
     }
 }
 
-final class HistoryTableView: NSTableView {
-    var confirmSelection: (() -> Void)?
-    var deleteSelection: (() -> Void)?
+/// Rows of the history list highlight like a menu: the selection follows the
+/// pointer and stays accent-coloured even though the search field, not the
+/// table, holds first responder.
+final class HistoryRowView: NSTableRowView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        identifier = NSUserInterfaceItemIdentifier("HistoryRow")
+    }
 
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 36 || event.keyCode == 76 {
-            confirmSelection?()
-            return
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var isEmphasized: Bool {
+        get { true }
+        set {}
+    }
+}
+
+final class HistoryTableView: NSTableView {
+    /// The click count of the mouse-down that led to the current action, read
+    /// instead of `NSApp.currentEvent` so the action never misreads the event
+    /// it was sent for.
+    private(set) var lastClickCount = 0
+
+    private var hoverTrackingArea: NSTrackingArea?
+
+    /// Every key belongs to the search field, which routes what the list needs
+    /// back to it. Letting the table take focus would silently redirect typing
+    /// into its own type-select.
+    override var acceptsFirstResponder: Bool { false }
+
+    override func mouseDown(with event: NSEvent) {
+        lastClickCount = event.clickCount
+        super.mouseDown(with: event)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTrackingArea {
+            removeTrackingArea(hoverTrackingArea)
         }
-        if event.keyCode == 51 || event.keyCode == 117 {
-            deleteSelection?()
-            return
-        }
-        super.keyDown(with: event)
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        selectRow(at: convert(event.locationInWindow, from: nil))
+    }
+
+    /// Re-runs the hover selection after the rows moved under a stationary
+    /// pointer, which mouse-moved events alone would not report.
+    func selectRowUnderPointer() {
+        guard let window, window.isVisible else { return }
+        let point = convert(window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+        guard visibleRect.contains(point) else { return }
+        selectRow(at: point)
+    }
+
+    /// Moves the selection to whatever row sits under the pointer. Points
+    /// outside the rows keep the current selection so the panel never ends up
+    /// with nothing to restore.
+    private func selectRow(at point: NSPoint) {
+        let row = self.row(at: point)
+        guard row >= 0, row != selectedRow else { return }
+        selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
     }
 }
 
@@ -96,6 +156,9 @@ final class HistoryPanel: NSPanel {
         isMovable = false
         isMovableByWindowBackground = false
         hidesOnDeactivate = true
+        // The history list highlights the row under the pointer, so the panel
+        // takes mouse-moved events rather than dropping them.
+        acceptsMouseMovedEvents = true
         animationBehavior = .utilityWindow
     }
 
