@@ -400,14 +400,17 @@ fn search_prefix_page(
     let fetch_limit = (limit + 1) as i64;
     // rusqlite requires every named parameter to exist in both SQL variants.
     // The NULL guard keeps `:key` present when the expression index uses LIKE.
+    // Both variants collate NOCASE so the seek matches idx_clips_text_prefix and
+    // agrees with the case-insensitive LIKE that filters the full text below.
     let (prefix_clause, key) = if needle.chars().count() <= 64 {
         (
-            ":key IS NULL AND substr(c.normalized_text, 1, 64) LIKE :pattern ESCAPE '\\'",
+            ":key IS NULL
+             AND substr(c.normalized_text, 1, 64) COLLATE NOCASE LIKE :pattern ESCAPE '\\'",
             None,
         )
     } else {
         (
-            "substr(c.normalized_text, 1, 64) = :key",
+            "substr(c.normalized_text, 1, 64) COLLATE NOCASE = :key",
             Some(needle.chars().take(64).collect::<String>()),
         )
     };
@@ -599,14 +602,16 @@ mod tests {
             &connection,
             "EXPLAIN QUERY PLAN
              SELECT id FROM clips
-             WHERE substr(normalized_text, 1, 64) LIKE ?1 ESCAPE '\\'
+             WHERE substr(normalized_text, 1, 64) COLLATE NOCASE LIKE ?1 ESCAPE '\\'
                AND normalized_text LIKE ?1 ESCAPE '\\'
              ORDER BY last_used_at DESC, id DESC
              LIMIT ?2",
             params!["alpha%", 50_i64],
         );
+        // A case-insensitive LIKE can only seek an index collated the same way,
+        // so a plain SCAN here means the NOCASE collation drifted apart.
         assert!(
-            prefix_plan.contains("idx_clips_text_prefix"),
+            prefix_plan.contains("SEARCH clips USING INDEX idx_clips_text_prefix"),
             "prefix expression index missing: {prefix_plan}"
         );
 

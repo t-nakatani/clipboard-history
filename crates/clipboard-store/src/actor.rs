@@ -1115,6 +1115,78 @@ mod tests {
     }
 
     #[test]
+    fn search_ignores_case_in_every_match_mode() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-search-case-test-{unique}"));
+        let service = HistoryService::new(
+            StoreHandle::open(StoreOptions::new(
+                root.join("history.sqlite"),
+                root.join("payloads"),
+            ))
+            .unwrap(),
+            SearchTextPolicy::default(),
+        );
+        // A needle longer than 64 characters takes the equality branch of the
+        // prefix seek instead of the LIKE one, so both are exercised here.
+        let long = "Lorem Ipsum Dolor Sit Amet Consectetur Adipiscing Elit Sed Do Eiusmod Tempor";
+        for (timestamp, value) in [
+            (1, "Alpha"),
+            (2, "ALPHABET"),
+            (3, "x aLpHa y"),
+            (4, "unrelated"),
+            (5, long),
+        ] {
+            service
+                .capture(
+                    ClipboardSnapshot {
+                        representations: vec![Representation {
+                            uti: "public.utf8-plain-text".into(),
+                            bytes: value.as_bytes().to_vec(),
+                        }],
+                        image_preview: None,
+                    },
+                    ClipKind::Text,
+                    timestamp,
+                )
+                .unwrap();
+        }
+
+        let exact = service
+            .search("alpha", clipboard_core::MatchMode::Exact, 50)
+            .unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].preview.as_deref(), Some("Alpha"));
+
+        let prefix = service
+            .search("aLPha", clipboard_core::MatchMode::Prefix, 50)
+            .unwrap();
+        assert_eq!(prefix.len(), 2);
+
+        let substring = service
+            .search("ALPHA", clipboard_core::MatchMode::Substring, 50)
+            .unwrap();
+        assert_eq!(substring.len(), 3);
+
+        // Needles shorter than three characters are planned as a bounded recent
+        // scan rather than an index lookup.
+        let short_scan = service
+            .search("AL", clipboard_core::MatchMode::Substring, 50)
+            .unwrap();
+        assert_eq!(short_scan.len(), 3);
+
+        let long_prefix = service
+            .search(&long.to_uppercase(), clipboard_core::MatchMode::Prefix, 50)
+            .unwrap();
+        assert_eq!(long_prefix.len(), 1);
+
+        drop(service);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn keyset_pages_remain_ordered_across_equal_timestamps_and_mutations() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
