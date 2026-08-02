@@ -32,9 +32,10 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         action: nil
     )
     private weak var historyClipView: NSClipView?
-    /// Set while the keyboard drives the selection, so the scrolling it causes
-    /// does not hand the selection back to the row under the pointer.
-    private var isMovingSelectionByKey = false
+    /// Set while the list scrolls itself — keyboard selection, or the anchor
+    /// put back after a page arrives — so that scrolling does not hand the
+    /// selection to whatever row happens to slide under the pointer.
+    private var isScrollingProgrammatically = false
 
     init(
         configuration: HistoryPanelConfiguration,
@@ -124,8 +125,6 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         tableView.delegate = self
         tableView.target = self
         tableView.action = #selector(restoreClicked)
-        tableView.confirmSelection = { [weak self] in self?.restoreSelected() }
-        tableView.deleteSelection = { [weak self] in self?.deleteSelected() }
 
         let scrollView = NSScrollView()
         scrollView.documentView = tableView
@@ -187,15 +186,24 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         feed.scheduleSearch(text: searchField.stringValue, mode: selectedSearchMode)
     }
 
-    /// The search field keeps first responder for the panel's whole life, so the
-    /// list's keys are routed through it. Backspace only reaches the list once
-    /// the query is empty; until then it belongs to the text being typed.
+    /// The table refuses first responder, so every key arrives here and the
+    /// ones the list needs are routed on. Backspace only reaches the list once
+    /// the query is empty; until then it belongs to the text being typed, and
+    /// Escape is left alone so it still clears the query before closing.
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
         switch selector {
         case #selector(NSResponder.moveUp(_:)):
             moveSelection(by: -1)
         case #selector(NSResponder.moveDown(_:)):
             moveSelection(by: 1)
+        case #selector(NSResponder.scrollPageUp(_:)), #selector(NSResponder.pageUp(_:)):
+            moveSelection(by: -visibleRowCount)
+        case #selector(NSResponder.scrollPageDown(_:)), #selector(NSResponder.pageDown(_:)):
+            moveSelection(by: visibleRowCount)
+        case #selector(NSResponder.moveToBeginningOfDocument(_:)):
+            select(row: 0)
+        case #selector(NSResponder.moveToEndOfDocument(_:)):
+            select(row: feed.rows.count - 1)
         case #selector(NSResponder.insertNewline(_:)):
             restoreSelected()
         case #selector(NSResponder.deleteBackward(_:)), #selector(NSResponder.deleteForward(_:)):
@@ -207,25 +215,44 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         return true
     }
 
-    /// Steps the selection while the pointer stays put, so the hover sync has to
-    /// stand down until the row is scrolled into view.
+    private var visibleRowCount: Int {
+        let rows = tableView.rows(in: tableView.visibleRect)
+        return rows.location == NSNotFound ? 1 : max(1, rows.length - 1)
+    }
+
     private func moveSelection(by offset: Int) {
-        guard !feed.rows.isEmpty else { return }
         let current = tableView.selectedRow
-        let next = current < 0
-            ? 0
-            : min(max(current + offset, 0), feed.rows.count - 1)
-        isMovingSelectionByKey = true
-        tableView.selectRowIndexes(IndexSet(integer: next), byExtendingSelection: false)
-        tableView.scrollRowToVisible(next)
-        isMovingSelectionByKey = false
+        select(row: current < 0 ? 0 : current + offset)
+    }
+
+    /// Puts the selection on `row`, clamped to the rows on hand, while the
+    /// pointer stays put — so the hover sync has to stand down until the row is
+    /// scrolled into view.
+    private func select(row: Int) {
+        guard !feed.rows.isEmpty else { return }
+        let target = min(max(row, 0), feed.rows.count - 1)
+        withProgrammaticScroll {
+            tableView.selectRowIndexes(IndexSet(integer: target), byExtendingSelection: false)
+            tableView.scrollRowToVisible(target)
+        }
+    }
+
+    /// Holds the hover sync down for the scroll `body` causes. The release is
+    /// deferred because a scroll can also land a page request whose rows, and
+    /// whose restored anchor, only arrive on a later turn of the run loop.
+    private func withProgrammaticScroll(_ body: () -> Void) {
+        isScrollingProgrammatically = true
+        body()
+        DispatchQueue.main.async { [weak self] in
+            self?.isScrollingProgrammatically = false
+        }
     }
 
     /// A single click restores the row it landed on. Clicks in the empty area
     /// below the last row report no row, and the second click of a double click
     /// would otherwise restore the same clip twice.
     @objc private func restoreClicked() {
-        guard NSApp.currentEvent?.clickCount == 1 else { return }
+        guard tableView.lastClickCount == 1 else { return }
         let row = tableView.clickedRow
         guard feed.rows.indices.contains(row) else { return }
         restore(summary: feed.rows[row])
@@ -262,7 +289,7 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
 
     @objc private func historyBoundsDidChange() {
         feed.markActivity()
-        if !isMovingSelectionByKey {
+        if !isScrollingProgrammatically {
             tableView.selectRowUnderPointer()
         }
         let visibleRows = tableView.rows(in: tableView.visibleRect)
@@ -288,15 +315,17 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         apply()
 
         tableView.reloadData()
-        if let selectedId, let row = feed.rows.firstIndex(where: { $0.id == selectedId }) {
-            tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-        } else if reset {
-            tableView.deselectAll(nil)
-        }
-        if let anchor {
-            restoreVisibleAnchor(anchor)
-        } else if !feed.rows.isEmpty, tableView.selectedRow < 0 {
-            tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        withProgrammaticScroll {
+            if let selectedId, let row = feed.rows.firstIndex(where: { $0.id == selectedId }) {
+                tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            } else if reset {
+                tableView.deselectAll(nil)
+            }
+            if let anchor {
+                restoreVisibleAnchor(anchor)
+            } else if !feed.rows.isEmpty, tableView.selectedRow < 0 {
+                tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+            }
         }
     }
 

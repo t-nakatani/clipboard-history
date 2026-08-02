@@ -65,10 +65,22 @@ final class HistoryRowView: NSTableRowView {
 }
 
 final class HistoryTableView: NSTableView {
-    var confirmSelection: (() -> Void)?
-    var deleteSelection: (() -> Void)?
+    /// The click count of the mouse-down that led to the current action, read
+    /// instead of `NSApp.currentEvent` so the action never misreads the event
+    /// it was sent for.
+    private(set) var lastClickCount = 0
 
     private var hoverTrackingArea: NSTrackingArea?
+
+    /// Every key belongs to the search field, which routes what the list needs
+    /// back to it. Letting the table take focus would silently redirect typing
+    /// into its own type-select.
+    override var acceptsFirstResponder: Bool { false }
+
+    override func mouseDown(with event: NSEvent) {
+        lastClickCount = event.clickCount
+        super.mouseDown(with: event)
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -106,18 +118,6 @@ final class HistoryTableView: NSTableView {
         let row = self.row(at: point)
         guard row >= 0, row != selectedRow else { return }
         selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-    }
-
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 36 || event.keyCode == 76 {
-            confirmSelection?()
-            return
-        }
-        if event.keyCode == 51 || event.keyCode == 117 {
-            deleteSelection?()
-            return
-        }
-        super.keyDown(with: event)
     }
 }
 
