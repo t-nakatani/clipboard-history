@@ -51,9 +51,11 @@ pub fn configure_connection(connection: &Connection, cache_kib: usize) -> Result
     connection.pragma_update(None, "cache_size", -(cache_kib as i64))?;
     connection.pragma_update(None, "mmap_size", 0)?;
     // LIKE stays case-insensitive (the SQLite default) because searching the
-    // history for "http" must find "HTTP". Every search predicate is a LIKE, so
-    // this pragma alone decides how the whole feature compares text; the
-    // idx_clips_text_prefix collation follows it.
+    // history for "http" must find "HTTP". This pragma is what decides it for
+    // every LIKE predicate, and it only folds ASCII. The one search predicate
+    // that is not a LIKE -- the indexed prefix equality for needles longer than
+    // 64 characters -- carries an explicit NOCASE collation to match, as does
+    // idx_clips_text_prefix so that the seek survives.
     connection.pragma_update(None, "case_sensitive_like", "OFF")?;
     // Clipboard history holds secrets, so freed pages must not keep plaintext.
     // secure_delete makes SQLite zero deleted content in clips, representations,
@@ -281,6 +283,18 @@ mod tests {
             .pragma_query_value(None, "secure_delete", |row| row.get(0))
             .unwrap();
         assert_eq!(secure_delete, 1);
+    }
+
+    #[test]
+    fn configured_connections_compare_text_without_case() {
+        let connection = Connection::open_in_memory().unwrap();
+        configure_connection(&connection, 1024).unwrap();
+        // Case-insensitive search rests on this per-connection pragma, so it is
+        // worth pinning next to the connection setup and not only end to end.
+        let matches_ignoring_case: i64 = connection
+            .query_row("SELECT 'A' LIKE 'a'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(matches_ignoring_case, 1);
     }
 
     #[test]
@@ -526,10 +540,14 @@ mod tests {
             "the migrated prefix index is still case-sensitive: {definition}"
         );
         // The rebuild has to carry the existing rows over, not just the shape.
+        // INDEXED BY forces the read through the index; without it the planner
+        // scans this one-row table and the assertion would pass on an empty
+        // index. The NOT NULL term is required because the index is partial.
         let hits: i64 = connection
             .query_row(
-                "SELECT count(*) FROM clips
-                 WHERE substr(normalized_text, 1, 64) COLLATE NOCASE LIKE 'alph%'",
+                "SELECT count(*) FROM clips INDEXED BY idx_clips_text_prefix
+                 WHERE normalized_text IS NOT NULL
+                   AND substr(normalized_text, 1, 64) COLLATE NOCASE LIKE 'alph%'",
                 [],
                 |row| row.get(0),
             )
