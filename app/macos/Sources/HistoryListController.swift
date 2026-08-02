@@ -32,6 +32,9 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         action: nil
     )
     private weak var historyClipView: NSClipView?
+    /// Set while the keyboard drives the selection, so the scrolling it causes
+    /// does not hand the selection back to the row under the pointer.
+    private var isMovingSelectionByKey = false
 
     init(
         configuration: HistoryPanelConfiguration,
@@ -184,15 +187,56 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         feed.scheduleSearch(text: searchField.stringValue, mode: selectedSearchMode)
     }
 
+    /// The search field keeps first responder for the panel's whole life, so the
+    /// list's keys are routed through it. Backspace only reaches the list once
+    /// the query is empty; until then it belongs to the text being typed.
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        switch selector {
+        case #selector(NSResponder.moveUp(_:)):
+            moveSelection(by: -1)
+        case #selector(NSResponder.moveDown(_:)):
+            moveSelection(by: 1)
+        case #selector(NSResponder.insertNewline(_:)):
+            restoreSelected()
+        case #selector(NSResponder.deleteBackward(_:)), #selector(NSResponder.deleteForward(_:)):
+            guard searchField.stringValue.isEmpty else { return false }
+            deleteSelected()
+        default:
+            return false
+        }
+        return true
+    }
+
+    /// Steps the selection while the pointer stays put, so the hover sync has to
+    /// stand down until the row is scrolled into view.
+    private func moveSelection(by offset: Int) {
+        guard !feed.rows.isEmpty else { return }
+        let current = tableView.selectedRow
+        let next = current < 0
+            ? 0
+            : min(max(current + offset, 0), feed.rows.count - 1)
+        isMovingSelectionByKey = true
+        tableView.selectRowIndexes(IndexSet(integer: next), byExtendingSelection: false)
+        tableView.scrollRowToVisible(next)
+        isMovingSelectionByKey = false
+    }
+
     /// A single click restores the row it landed on. Clicks in the empty area
-    /// below the last row report no row and are ignored.
+    /// below the last row report no row, and the second click of a double click
+    /// would otherwise restore the same clip twice.
     @objc private func restoreClicked() {
-        guard tableView.clickedRow >= 0 else { return }
-        restoreSelected()
+        guard NSApp.currentEvent?.clickCount == 1 else { return }
+        let row = tableView.clickedRow
+        guard feed.rows.indices.contains(row) else { return }
+        restore(summary: feed.rows[row])
     }
 
     @objc private func restoreSelected() {
         guard let summary = selectedSummary else { return }
+        restore(summary: summary)
+    }
+
+    private func restore(summary: ClipSummaryDto) {
         statusDidChange?(.restoring)
         feed.representations(for: summary.id) { [weak self] result in
             do {
@@ -218,6 +262,9 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
 
     @objc private func historyBoundsDidChange() {
         feed.markActivity()
+        if !isMovingSelectionByKey {
+            tableView.selectRowUnderPointer()
+        }
         let visibleRows = tableView.rows(in: tableView.visibleRect)
         guard visibleRows.location != NSNotFound else { return }
         if visibleRows.location <= Self.pagingRowMargin, feed.hasMoreNewer {
@@ -299,9 +346,7 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         if let reused = tableView.makeView(withIdentifier: identifier, owner: self) as? HistoryRowView {
             return reused
         }
-        let rowView = HistoryRowView()
-        rowView.identifier = identifier
-        return rowView
+        return HistoryRowView()
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {

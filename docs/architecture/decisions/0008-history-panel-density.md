@@ -17,7 +17,7 @@ MaccyのUIは画面高の大部分を使い、textとimageで異なるrow height
 - textは14pt medium、補助metadataは11.5ptとする。
 - image previewは最大108pt幅でaspect ratioを保って表示する。画像だけのclipでは不要な`[image]` labelを隠す。
 - 固定headerとfooter actionを履歴領域から外す。上部はapp名、検索欄、検索modeだけにする。
-- Returnで復元、Delete/Backspaceで削除、終了はstatus itemの右click menuに置く。
+- 選択はpointerに追従させ、単一clickまたはReturnで復元する。削除は検索欄が空のときのDelete/Backspaceに割り当て、終了はstatus itemの右click menuに置く。
 - 上記の寸法・font・margin・panel appearanceは`HistoryPanelConfiguration.standard`へ集約し、panel、table、cellは同じimmutable設定値を受け取る。
 
 ## Consequences

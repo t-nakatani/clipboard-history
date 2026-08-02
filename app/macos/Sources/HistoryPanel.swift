@@ -48,9 +48,19 @@ final class TranslucentPanelContentView: NSView {
 /// pointer and stays accent-coloured even though the search field, not the
 /// table, holds first responder.
 final class HistoryRowView: NSTableRowView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        identifier = NSUserInterfaceItemIdentifier("HistoryRow")
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
     override var isEmphasized: Bool {
         get { true }
-        set { _ = newValue }
+        set {}
     }
 }
 
@@ -67,7 +77,7 @@ final class HistoryTableView: NSTableView {
         }
         let area = NSTrackingArea(
             rect: .zero,
-            options: [.mouseMoved, .activeAlways, .inVisibleRect],
+            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
             owner: self,
             userInfo: nil
         )
@@ -77,14 +87,22 @@ final class HistoryTableView: NSTableView {
 
     override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
-        selectRow(under: event)
+        selectRow(at: convert(event.locationInWindow, from: nil))
     }
 
-    /// Moves the selection to whatever row sits under the pointer. Rows outside
-    /// the list keep the current selection so the panel never ends up with
-    /// nothing to restore.
-    private func selectRow(under event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
+    /// Re-runs the hover selection after the rows moved under a stationary
+    /// pointer, which mouse-moved events alone would not report.
+    func selectRowUnderPointer() {
+        guard let window, window.isVisible else { return }
+        let point = convert(window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+        guard visibleRect.contains(point) else { return }
+        selectRow(at: point)
+    }
+
+    /// Moves the selection to whatever row sits under the pointer. Points
+    /// outside the rows keep the current selection so the panel never ends up
+    /// with nothing to restore.
+    private func selectRow(at point: NSPoint) {
         let row = self.row(at: point)
         guard row >= 0, row != selectedRow else { return }
         selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
@@ -138,8 +156,8 @@ final class HistoryPanel: NSPanel {
         isMovable = false
         isMovableByWindowBackground = false
         hidesOnDeactivate = true
-        // The history list highlights the row under the pointer, which needs
-        // mouse-moved events to reach its tracking area.
+        // The history list highlights the row under the pointer, so the panel
+        // takes mouse-moved events rather than dropping them.
         acceptsMouseMovedEvents = true
         animationBehavior = .utilityWindow
     }

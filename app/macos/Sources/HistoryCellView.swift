@@ -80,6 +80,16 @@ final class HistoryCellView: NSTableCellView {
         ])
     }
 
+    /// `previewLabel` is the cell's `textField` and follows the background on
+    /// its own. The metadata is ours to keep readable on the accent fill.
+    override var backgroundStyle: NSView.BackgroundStyle {
+        didSet {
+            metadataLabel.textColor = backgroundStyle == .emphasized
+                ? NSColor.alternateSelectedControlTextColor.withAlphaComponent(0.75)
+                : .tertiaryLabelColor
+        }
+    }
+
     func configureForImagePreview(_ showsImagePreview: Bool) {
         thumbnailImageView.isHidden = !showsImagePreview
         thumbnailWidthConstraint.constant = showsImagePreview ? configuration.rows.imageWidth : 0
