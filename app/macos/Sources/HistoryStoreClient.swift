@@ -5,6 +5,12 @@ struct PersistedCapture {
     let recentPage: HistoryPageDto
 }
 
+/// Carries the shutdown result off the store queue. The semaphore that guards it
+/// orders the write before the read, so no further synchronisation is needed.
+private final class ShutdownBox {
+    var result: Result<Void, Error>?
+}
+
 final class HistoryStoreClient {
     typealias Completion<Value> = (Result<Value, Error>) -> Void
 
@@ -46,8 +52,30 @@ final class HistoryStoreClient {
         }
     }
 
-    func shutdown() throws {
-        try queue.sync { try engine.shutdown() }
+    enum ShutdownOutcome {
+        case completed
+        case timedOut
+    }
+
+    /// Requests a clean shutdown, giving up after `timeout`.
+    ///
+    /// Maintenance may already own the store queue, and the Rust actor runs its
+    /// commands serially, so the shutdown command can be queued behind an
+    /// incremental vacuum or an FTS optimize. Abandoning the wait only costs a
+    /// startup recovery pass on the next launch, which is what recovery exists
+    /// for; blocking indefinitely at termination risks being killed instead.
+    func shutdown(timeout: TimeInterval) throws -> ShutdownOutcome {
+        let outcome = ShutdownBox()
+        let semaphore = DispatchSemaphore(value: 0)
+        queue.async { [engine] in
+            outcome.result = Result { try engine.shutdown() }
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + timeout) == .success else {
+            return .timedOut
+        }
+        try outcome.result?.get()
+        return .completed
     }
 
     func capture(
