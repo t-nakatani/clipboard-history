@@ -123,8 +123,12 @@ final class HistoryFeedModel {
         }
         markActivity()
         generation += 1
-        guard let store else { return }
+        // Recorded before the store is required, the way `loadRecent` does it.
+        // The panel is usable while the store is still opening, so a search
+        // typed then has to be what `attach`'s reload replays — otherwise the
+        // recent feed loads under a search field that still holds text.
         query = .search(text: text, mode: mode)
+        guard let store else { return }
         let issued = generation
         isLoadingPage = true
         statusDidChange?(.searching)

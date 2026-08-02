@@ -471,6 +471,50 @@ func runHistoryFeedSelfTest() -> Int32 {
         return 1
     }
 
+    // A search typed while the store is still opening has to be the query that
+    // attachment replays; otherwise the recent feed loads under a search field
+    // that still holds the text.
+    let pendingSearchStore = StubHistoryStore(
+        recentPageResult: fixturePage(ids: [3, 2, 1]),
+        searchPageResult: fixturePage(ids: [2])
+    )
+    let pendingFeed = HistoryFeedModel(onStoreActivity: {})
+    pendingFeed.search(text: "item", mode: .substring)
+    pendingFeed.attach(store: pendingSearchStore)
+    pendingFeed.reload()
+    guard
+        pendingSearchStore.searchPageCalls == 1,
+        pendingSearchStore.recentPageCalls == 0,
+        pendingFeed.rows.map(\.id) == [2]
+    else {
+        fputs("a search entered before the store opened was lost on attachment\n", stderr)
+        return 1
+    }
+
+    // Startup recovery writes its outcome to the detail line and then reloads.
+    // That load reports no detail, so the outcome stays readable.
+    let recoveryStore = StubHistoryStore(
+        recentPageResult: fixturePage(ids: [3, 2, 1]),
+        searchPageResult: fixturePage(ids: [])
+    )
+    let recoveryFeed = HistoryFeedModel(store: recoveryStore, onStoreActivity: {})
+    var recoveryStatuses: [HistoryStatus] = []
+    recoveryFeed.statusDidChange = { recoveryStatuses.append($0) }
+    recoveryFeed.reload(keepingDetail: true)
+    guard case let .loaded(count, newestPreview)? = recoveryStatuses.last,
+          count == 3,
+          newestPreview == nil
+    else {
+        fputs("a load asked to keep the detail line still described the newest row\n", stderr)
+        return 1
+    }
+    recoveryStatuses.removeAll()
+    recoveryFeed.reload()
+    guard case let .loaded(_, ordinaryPreview)? = recoveryStatuses.last, ordinaryPreview != nil else {
+        fputs("an ordinary load stopped describing the newest row\n", stderr)
+        return 1
+    }
+
     return 0
 }
 
