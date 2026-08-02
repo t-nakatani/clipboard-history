@@ -119,6 +119,9 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
             width: 0,
             height: configuration.rows.intercellSpacing
         )
+        // The list always keeps a row selected: it is what Return restores, and
+        // a click below the last row would otherwise clear it.
+        tableView.allowsEmptySelection = false
         tableView.backgroundColor = .clear
         tableView.usesAlternatingRowBackgroundColors = false
         tableView.dataSource = self
@@ -200,9 +203,11 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
             moveSelection(by: -visibleRowCount)
         case #selector(NSResponder.scrollPageDown(_:)), #selector(NSResponder.pageDown(_:)):
             moveSelection(by: visibleRowCount)
-        case #selector(NSResponder.moveToBeginningOfDocument(_:)):
+        case #selector(NSResponder.moveToBeginningOfDocument(_:)),
+             #selector(NSResponder.scrollToBeginningOfDocument(_:)):
             select(row: 0)
-        case #selector(NSResponder.moveToEndOfDocument(_:)):
+        case #selector(NSResponder.moveToEndOfDocument(_:)),
+             #selector(NSResponder.scrollToEndOfDocument(_:)):
             select(row: feed.rows.count - 1)
         case #selector(NSResponder.insertNewline(_:)):
             restoreSelected()
@@ -238,8 +243,8 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
     }
 
     /// Holds the hover sync down for the scroll `body` causes. The release is
-    /// deferred because a scroll can also land a page request whose rows, and
-    /// whose restored anchor, only arrive on a later turn of the run loop.
+    /// deferred by a turn because the bounds change AppKit posts for that scroll
+    /// does not always land inside `body`.
     private func withProgrammaticScroll(_ body: () -> Void) {
         isScrollingProgrammatically = true
         body()
@@ -314,8 +319,8 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
 
         apply()
 
-        tableView.reloadData()
         withProgrammaticScroll {
+            tableView.reloadData()
             if let selectedId, let row = feed.rows.firstIndex(where: { $0.id == selectedId }) {
                 tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             } else if reset {

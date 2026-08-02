@@ -19,7 +19,7 @@ Rust storeは起動中markerを所有し、clean shutdown時にtruncate checkpoi
 
 画像はcapture時にImageIOで最大96pxのJPEG previewをstore用serial queue上で生成します。previewは原representation、canonical identity、復元payloadから独立しており、最大64KiBです。一覧summaryにはpreview bytesを入れず、表示対象だけを専用APIで非同期取得します。decoded image cacheは最大64件・概算4MiBに制限されます。
 
-menu bar iconの左クリックはメニューを挟まず、履歴panelを直接toggleします。panelはタイトルバーのない`.nonactivatingPanel`で、status itemの直下へ画面端を考慮して配置されます。背景はHUD blurと薄いindigo tint、前景は独立した不透明content viewに分離しています。これにより壁紙を透過させながら文字のcontrastを維持します。panel高は対象screenの表示可能領域の92%です。現在の設定はtext row 14pt、画像row 82pt、本文font 14ptで、固定header/footerを置かず履歴の目視数を優先します。開いた時点でメモリ上の最近50件が一覧表示され、検索欄へfocusします。外部clickまたはEscapeで閉じます。選択はpointerに追従し、単一clickまたはReturnで復元します。検索欄はfocusを保ったままなので、↑↓・Return・削除keyはsearch fieldから履歴listへ転送され、Delete/Backspaceは検索欄が空のときだけ削除になります。右クリックだけが終了用context menuを表示します。
+menu bar iconの左クリックはメニューを挟まず、履歴panelを直接toggleします。panelはタイトルバーのない`.nonactivatingPanel`で、status itemの直下へ画面端を考慮して配置されます。背景はHUD blurと薄いindigo tint、前景は独立した不透明content viewに分離しています。これにより壁紙を透過させながら文字のcontrastを維持します。panel高は対象screenの表示可能領域の92%です。現在の設定はtext row 14pt、画像row 82pt、本文font 14ptで、固定header/footerを置かず履歴の目視数を優先します。開いた時点でメモリ上の最近50件が一覧表示され、検索欄へfocusします。外部clickまたはEscapeで閉じます。選択はpointerに追従し、単一clickまたはReturnで復元します。検索欄はfocusを保ったままなので、↑↓・Page Up/Down・Cmd+↑↓・Return・削除keyはsearch fieldから履歴listへ転送され、Delete/Backspaceは検索欄が空のときだけ削除になります。右クリックだけが終了用context menuを表示します。
 
 UI寸法と外観は`Sources/HistoryPanelConfiguration.swift`の`standard`へ集約しています。調整可能な項目はwindow幅・初期高・最小高・画面高比率、panel内margin、section間隔、検索欄間隔、text/image row高、row間隔、thumbnail幅・上下余白、textとmetadataの間隔、各font size、角丸、border、blur濃度、tintです。`AppDelegate`、`HistoryPanel`、`HistoryCellView`へ数値を重複して持たせません。
 
