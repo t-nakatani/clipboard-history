@@ -173,8 +173,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             switch result {
             case let .success(report):
                 // The status label belongs to the load that follows, so the
-                // outcome goes to the detail label to survive it. After a
-                // rebuild the history is empty, so the load leaves it alone.
+                // outcome goes to the detail label, which that load is asked to
+                // leave alone. The preview it would have shown comes back with
+                // the next thing the user does.
                 if report.databaseRebuilt {
                     let quarantine = report.quarantinePath ?? "隔離先を確認できません"
                     self.detailLabel.stringValue = "破損した履歴を隔離して再構築 · \(quarantine)"
@@ -191,7 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 NSLog("Clipboard History startup recovery failed: %@", error.localizedDescription)
                 self.detailLabel.stringValue = "起動時リカバリーに失敗: \(error.localizedDescription)"
             }
-            self.reloadHistory()
+            self.reloadHistory(keepingDetail: true)
         }
     }
 
@@ -377,7 +378,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         detailLabel.stringValue = error.localizedDescription
     }
 
-    private func reloadHistory() {
+    /// Loads the recent page.
+    ///
+    /// `keepingDetail` leaves the detail label as it is instead of describing
+    /// the newest row. Startup recovery uses it so its outcome stays readable
+    /// across the load it triggers; every other caller wants the preview.
+    private func reloadHistory(keepingDetail: Bool = false) {
         markStoreActivity()
         if !searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             performSearch()
@@ -395,7 +401,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             case let .success(page):
                 self.apply(page: page, reset: true)
                 self.statusLabel.stringValue = "履歴 \(page.items.count)件を読み込み済み"
-                if let newest = page.items.first {
+                if !keepingDetail, let newest = page.items.first {
                     self.detailLabel.stringValue = newest.preview ?? newest.kind
                 }
             case let .failure(error):
