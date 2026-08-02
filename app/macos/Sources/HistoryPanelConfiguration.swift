@@ -21,6 +21,7 @@ struct HistoryPanelConfiguration {
         let sectionSpacing: CGFloat
         let searchItemSpacing: CGFloat
         let minimumHistoryHeight: CGFloat
+        let statusRowHeight: CGFloat
     }
 
     struct Rows {
@@ -80,7 +81,10 @@ struct HistoryPanelConfiguration {
             trailingInset: 3,
             sectionSpacing: 3,
             searchItemSpacing: 10,
-            minimumHistoryHeight: 380
+            // The status footer costs `sectionSpacing + statusRowHeight`, taken out
+            // of the history area so the panel still fits its 700x440 minimum.
+            minimumHistoryHeight: 356,
+            statusRowHeight: 21
         ),
         rows: Rows(
             textHeight: 22,

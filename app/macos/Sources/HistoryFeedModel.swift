@@ -209,8 +209,7 @@ final class HistoryFeedModel {
         markActivity()
         statusDidChange?(.capturing(
             types: candidate.representationTypes,
-            payloadBytes: candidate.payloadBytes,
-            identity: candidate.identity
+            payloadBytes: candidate.payloadBytes
         ))
         let copiedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
         store.capture(
@@ -222,7 +221,6 @@ final class HistoryFeedModel {
             case let .success(capture):
                 self.statusDidChange?(.captured(
                     inserted: capture.result.inserted,
-                    id: capture.result.id,
                     residentCount: capture.recentPage.items.count
                 ))
                 self.absorb(capture)
@@ -235,11 +233,12 @@ final class HistoryFeedModel {
     func delete(id: Int64) {
         guard let store else { return }
         markActivity()
+        let preview = window.rows.first { $0.id == id }.map { $0.preview ?? $0.kind }
         store.delete(id: id) { [weak self] result in
             guard let self else { return }
             switch result {
             case .success(true):
-                self.statusDidChange?(.deleted)
+                self.statusDidChange?(.deleted(preview: preview))
                 self.reload()
             case .success(false):
                 self.reload()
@@ -314,9 +313,8 @@ final class HistoryFeedModel {
                 self.apply(page: page, reset: true)
                 self.statusDidChange?(.loaded(
                     count: page.items.count,
-                    newestPreview: keepingDetail
-                        ? nil
-                        : page.items.first.map { $0.preview ?? $0.kind }
+                    newestPreview: page.items.first.map { $0.preview ?? $0.kind },
+                    keepsDetail: keepingDetail
                 ))
             case let .failure(error):
                 self.statusDidChange?(.failed(error))

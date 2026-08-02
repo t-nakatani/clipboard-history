@@ -13,17 +13,36 @@ enum HistoryStatus {
     case recoveryRebuilt(quarantinePath: String?)
     case recoveryCompleted(reclaimedFiles: UInt64)
     case recoveryFailed(String)
-    case capturing(types: [String], payloadBytes: Int, identity: String)
-    case captured(inserted: Bool, id: Int64, residentCount: Int)
+    case capturing(types: [String], payloadBytes: Int)
+    case captured(inserted: Bool, residentCount: Int)
     case newerAvailable
     case rejected(CaptureFilterDecisionDto)
-    case loaded(count: Int, newestPreview: String?)
+    case loaded(count: Int, newestPreview: String?, keepsDetail: Bool)
     case searching
     case searchCompleted(count: Int)
     case restoring
     case restored(preview: String)
-    case deleted
+    case deleted(preview: String?)
     case failed(Error)
+
+    /// How hard the status has to try to reach the user.
+    ///
+    /// The status row lives in the panel, which is closed most of the time. An
+    /// `important` status raised while it is closed would otherwise be buried by
+    /// the save and search chatter that follows before the user ever looks.
+    enum Priority {
+        case routine
+        case important
+    }
+
+    var priority: Priority {
+        switch self {
+        case .recoveryRebuilt, .recoveryFailed, .failed:
+            return .important
+        default:
+            return .routine
+        }
+    }
 
     var headline: String? {
         switch self {
@@ -33,17 +52,23 @@ enum HistoryStatus {
             return "コピー待機中"
         case .recovering:
             return "前回の終了状態を検証中…"
-        case .recoveryRebuilt, .recoveryCompleted, .recoveryFailed:
+        case .recoveryRebuilt:
+            return "履歴が破損したため再構築しました"
+        case .recoveryFailed:
+            return "起動時チェックに失敗しました"
+        // The load that follows recovery owns the headline; only the detail
+        // below carries the outcome, and that load is asked to keep it.
+        case .recoveryCompleted:
             return nil
         case .capturing:
             return "保存中…"
-        case let .captured(inserted, _, _):
+        case let .captured(inserted, _):
             return inserted ? "履歴へ保存" : "既存履歴を先頭へ移動"
         case .newerAvailable:
             return "新しい履歴あり"
         case .rejected:
             return "保存対象外"
-        case let .loaded(count, _):
+        case let .loaded(count, _, _):
             return "履歴 \(count)件を読み込み済み"
         case .searching:
             return "検索中…"
@@ -52,7 +77,7 @@ enum HistoryStatus {
         case .restoring:
             return "復元中…"
         case .restored:
-            return "Pasteboardへ復元"
+            return "クリップボードへ復元"
         case .deleted:
             return "履歴を削除"
         case .failed:
@@ -62,36 +87,56 @@ enum HistoryStatus {
 
     var detail: String? {
         switch self {
-        case .preparingStorage, .idle, .recovering, .newerAvailable, .searching, .restoring, .deleted:
+        case .preparingStorage, .idle, .recovering, .searching, .restoring:
             return nil
         case let .recoveryRebuilt(quarantinePath):
-            return "破損した履歴を隔離して再構築 · \(quarantinePath ?? "隔離先を確認できません")"
+            return quarantinePath.map { "以前の履歴は復元できません。退避先: \($0)" }
+                ?? "以前の履歴は復元できません。退避先を確認できませんでした。"
         case let .recoveryCompleted(reclaimedFiles):
-            return "起動時リカバリー完了 · 孤児payload \(reclaimedFiles)件を回収"
+            return reclaimedFiles > 0
+                ? "起動時チェック完了 · 不要になったデータ \(reclaimedFiles)件を整理しました"
+                : "起動時チェック完了 · 履歴に問題は見つかりませんでした"
         case let .recoveryFailed(description):
-            return "起動時リカバリーに失敗: \(description)"
-        case let .capturing(types, payloadBytes, identity):
-            let shortIdentity = String(identity.prefix(12))
-            return "\(types.joined(separator: ", "))\n\(payloadBytes) bytes · hash \(shortIdentity)…"
-        case let .captured(_, id, residentCount):
-            return "clip #\(id) · 最近\(residentCount)件をメモリ保持"
+            return description
+        case let .capturing(types, payloadBytes):
+            let size = ByteCountFormatter.string(
+                fromByteCount: Int64(payloadBytes),
+                countStyle: .file
+            )
+            return "\(Self.readableKind(for: types)) · \(size)"
+        case let .captured(_, residentCount):
+            return "履歴 \(residentCount)件"
+        case .newerAvailable:
+            return "上へスクロールすると表示されます"
         case let .rejected(decision):
             switch decision {
             case .rejectConcealed:
-                return "concealed markerを型一覧から検知しました。payload bytesは読み取っていません。"
+                return "パスワードなど秘匿指定された内容のため、中身を読み取らずに破棄しました。"
             case .rejectTransient:
-                return "transient markerを型一覧から検知しました。payload bytesは読み取っていません。"
+                return "一時的な内容として指定されていたため、中身を読み取らずに破棄しました。"
             case .accept:
                 return nil
             }
-        case let .loaded(_, newestPreview):
-            return newestPreview
+        case let .loaded(_, newestPreview, keepsDetail):
+            guard !keepsDetail else { return nil }
+            return newestPreview ?? "履歴はまだありません"
         case .searchCompleted:
             return "完全一致・前方一致・正確な部分一致のみ"
         case let .restored(preview):
             return preview
+        case let .deleted(preview):
+            return preview
         case let .failed(error):
             return error.localizedDescription
         }
+    }
+
+    /// Plain-language equivalent of the captured UTI list for the status row.
+    private static func readableKind(for types: [String]) -> String {
+        let types = Set(types)
+        if !types.isDisjoint(with: ["public.png", "public.tiff"]) { return "画像" }
+        if types.contains("public.file-url") { return "ファイル" }
+        if !types.isDisjoint(with: ["public.rtf", "public.html"]) { return "リッチテキスト" }
+        return "テキスト"
     }
 }
