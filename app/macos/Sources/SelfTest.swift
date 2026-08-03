@@ -678,9 +678,91 @@ private func layoutStatusRow() -> Int32 {
     return 0
 }
 
+/// Covers the thumbnail cache against clip ids being handed out twice.
+func runPreviewCacheSelfTest() -> Int32 {
+    func imageBytes(side: Int) -> Data {
+        let representation = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: side,
+            pixelsHigh: side,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        )!
+        return representation.representation(using: .png, properties: [:])!
+    }
+
+    func summary(id: Int64, lastUsedAtMs: Int64) -> ClipSummaryDto {
+        ClipSummaryDto(
+            id: id,
+            kind: "image",
+            lastUsedAtMs: lastUsedAtMs,
+            pinned: false,
+            copyCount: 1,
+            payloadSize: 1,
+            preview: nil,
+            hasImagePreview: true
+        )
+    }
+
+    // Distinguished by side length, so the assertions can name which preview
+    // came back rather than only that something did.
+    var served = imageBytes(side: 4)
+    var fetches = 0
+    let loader = ImagePreviewLoader { _, completion in
+        fetches += 1
+        completion(RepresentationDto(uti: "public.png", bytes: served))
+    }
+
+    let deleted = summary(id: 7, lastUsedAtMs: 100)
+    loader.load(deleted)
+    guard let cached = loader.cachedImage(for: deleted), cached.size.width == 4 else {
+        fputs("a loaded preview was not cached for the row that asked for it\n", stderr)
+        return 1
+    }
+    guard fetches == 1 else {
+        fputs("expected exactly one fetch, saw \(fetches)\n", stderr)
+        return 1
+    }
+
+    // Deleting the newest clip returns its id to SQLite, which hands it to the
+    // next capture. That clip is a different picture under the same id.
+    served = imageBytes(side: 8)
+    let reused = summary(id: 7, lastUsedAtMs: 200)
+    if let stale = loader.cachedImage(for: reused) {
+        fputs(
+            "a reused clip id was served the deleted clip's preview (\(Int(stale.size.width))px)\n",
+            stderr
+        )
+        return 1
+    }
+    loader.load(reused)
+    guard let fresh = loader.cachedImage(for: reused), fresh.size.width == 8 else {
+        fputs("the clip that reused the id did not get its own preview\n", stderr)
+        return 1
+    }
+
+    // Rows that have not changed still read from the cache; scrolling must not
+    // turn into one fetch per redraw.
+    let before = fetches
+    _ = loader.cachedImage(for: reused)
+    _ = loader.cachedImage(for: reused)
+    guard fetches == before else {
+        fputs("an unchanged row refetched its preview\n", stderr)
+        return 1
+    }
+
+    return 0
+}
+
 func runSelfTest() -> Int32 {
     let stages: [(String, () -> Int32)] = [
         ("bindings", runBindingSelfTest),
+        ("preview cache", runPreviewCacheSelfTest),
         ("history feed", runHistoryFeedSelfTest),
         ("status row", runStatusRowSelfTest),
     ]
