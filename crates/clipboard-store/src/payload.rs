@@ -169,10 +169,14 @@ impl PayloadStore {
                         continue;
                     }
                     let name = file.file_name();
-                    let name = name.to_string_lossy();
+                    // Non-UTF-8 names can never be a payload hash or a staged
+                    // temporary, so they are skipped instead of parsed.
+                    let Some(name) = name.to_str() else {
+                        continue;
+                    };
                     if name.starts_with(".stage-") {
                         visitor(PayloadEntry::Staged(file.path()))?;
-                    } else if let Some(hash) = parse_hash(&name) {
+                    } else if let Some(hash) = parse_hash(name) {
                         visitor(PayloadEntry::Payload(hash))?;
                     }
                 }
@@ -187,16 +191,32 @@ pub(crate) enum PayloadEntry {
     Staged(PathBuf),
 }
 
+/// Parses a 64-character hexadecimal file name into a payload hash.
+///
+/// Works on raw bytes rather than string slices, so a name whose byte length
+/// is 64 but which contains multibyte characters can never cause a char
+/// boundary panic; it simply fails the hex-digit check and returns `None`.
 fn parse_hash(value: &str) -> Option<PayloadHash> {
-    if value.len() != 64 {
+    let input = value.as_bytes();
+    if input.len() != 64 {
         return None;
     }
     let mut bytes = [0_u8; 32];
     for (index, byte) in bytes.iter_mut().enumerate() {
-        let start = index * 2;
-        *byte = u8::from_str_radix(&value[start..start + 2], 16).ok()?;
+        let high = hex_digit(input[index * 2])?;
+        let low = hex_digit(input[index * 2 + 1])?;
+        *byte = (high << 4) | low;
     }
     Some(PayloadHash(bytes))
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Opens a payload file without following a symlink at the final component.
@@ -510,6 +530,75 @@ mod tests {
         assert!(!stored.path.exists());
         assert_eq!(fs::read(&witness).unwrap(), vec![0_u8; secret.len()]);
         assert!(!store.remove_if_exists(stored.hash).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn visit_hashes(store: &PayloadStore) -> Vec<PayloadHash> {
+        let mut hashes = Vec::new();
+        store
+            .visit_entries(|entry| {
+                if let PayloadEntry::Payload(hash) = entry {
+                    hashes.push(hash);
+                }
+                Ok(())
+            })
+            .unwrap();
+        hashes
+    }
+
+    #[test]
+    fn parse_hash_rejects_malformed_names_without_panicking() {
+        // 64 bytes of multibyte UTF-8 (32 chars, 2 bytes each): the old
+        // byte-offset slicing panicked on a char boundary here.
+        let multibyte = "é".repeat(32);
+        assert_eq!(multibyte.len(), 64);
+        assert!(parse_hash(&multibyte).is_none());
+
+        // Mixed: hex prefix followed by multibyte characters, still 64 bytes.
+        let mixed = format!("{}{}", "a".repeat(61), "あ");
+        assert_eq!(mixed.len(), 64);
+        assert!(parse_hash(&mixed).is_none());
+
+        // Wrong lengths.
+        assert!(parse_hash("").is_none());
+        assert!(parse_hash(&"a".repeat(63)).is_none());
+        assert!(parse_hash(&"a".repeat(65)).is_none());
+
+        // Right length, not hexadecimal. `+` in particular was accepted by
+        // `u8::from_str_radix`.
+        assert!(parse_hash(&"g".repeat(64)).is_none());
+        assert!(parse_hash(&"+1".repeat(32)).is_none());
+
+        // A valid name round-trips.
+        let hash = PayloadHash::of(b"payload");
+        assert_eq!(parse_hash(&hash.to_hex()), Some(hash));
+        assert_eq!(parse_hash(&hash.to_hex().to_uppercase()), Some(hash));
+    }
+
+    #[test]
+    fn visit_entries_skips_malformed_file_names() {
+        let root = temp_root("malformed-names");
+        let store = PayloadStore::new(&root);
+        let stored = store.put(b"payload").unwrap();
+        let dir = stored.path.parent().unwrap().to_path_buf();
+
+        // 64-byte multibyte UTF-8 name: previously panicked in parse_hash.
+        fs::write(dir.join("é".repeat(32)), b"junk").unwrap();
+        // Wrong length and non-hex names.
+        fs::write(dir.join("short"), b"junk").unwrap();
+        fs::write(dir.join("g".repeat(64)), b"junk").unwrap();
+        // Non-UTF-8 name: previously converted lossily and parsed. Some
+        // filesystems (e.g. APFS) refuse to create such names, so this part is
+        // best effort.
+        #[cfg(unix)]
+        {
+            use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+            let mut raw = vec![b'a'; 63];
+            raw.push(0xff);
+            let _ = fs::write(dir.join(OsStr::from_bytes(&raw)), b"junk");
+        }
+
+        assert_eq!(visit_hashes(&store), vec![stored.hash]);
         fs::remove_dir_all(root).unwrap();
     }
 
