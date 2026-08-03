@@ -13,7 +13,7 @@
 - メニューバーからの1クリックで開く半透明のAppKit履歴panel
 - Pasteboard type一覧をpayload読取前に検査する二段階capture
 - BLAKE3によるclip identityと`recopy = touch`
-- SQLite + FTS5 trigramによる部分一致検索
+- SQLite + FTS5 trigramによる、大文字小文字を区別しない部分一致検索
 - 100,000件のtransactional retentionと16KiB超payloadのcontent-addressed file保存
 - tombstone queueによる遅延GCと孤児payload回収
 - 50件単位の双方向keyset paging（保持summaryは最大200件）
@@ -23,13 +23,9 @@
 - ホバーでの行選択、シングルクリックまたはReturnでの復元、検索欄が空のときのDelete/Backspaceでの削除
 - tag pushでunsigned appを公開するrelease workflow
 
-### Changed
-
-- 検索モードの選択をやめ、常に正確な部分一致で検索する。modeの判断は`QueryPlanner`がneedle長から行う
-- substring検索のLIKEに対するESCAPE句を、needleがワイルドカードを含むときだけ出すようにした。無条件のESCAPEがtrigram索引を無効化していた
-- 検索で大文字小文字を区別しない
-
 ### Fixed
+
+初回リリースのため、いずれも公開前に修正したものです。
 
 - orphan GCが不正なファイル名でパニックする問題
 - capture境界でサイズ制限を強制し、oversizedなクリップを拒否する
