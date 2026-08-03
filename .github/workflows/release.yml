@@ -1,0 +1,168 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "リリースするタグ（例: v0.1.0-alpha.1）"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos-release:
+    name: Publish unsigned macOS app
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: meta
+        run: |
+          set -eu
+          tag="${{ inputs.tag || github.ref_name }}"
+          case "$tag" in
+            v*) ;;
+            *) echo "::error::タグは v で始まる必要があります: $tag"; exit 1 ;;
+          esac
+          version="${tag#v}"
+          # 0.1.0-alpha.1 のようなpre-release識別子を落としてversion coreを得る
+          core="${version%%-*}"
+          if [ "$version" = "$core" ]; then
+            prerelease=false
+          else
+            prerelease=true
+          fi
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "core=$core"
+            echo "prerelease=$prerelease"
+            echo "asset=ClipboardHistory-$tag-macos-arm64-unsigned.zip"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify version metadata matches tag
+        run: |
+          set -eu
+          core="${{ steps.meta.outputs.core }}"
+          plist_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' app/macos/Info.plist)
+          if [ "$plist_version" != "$core" ]; then
+            echo "::error::Info.plistのCFBundleShortVersionString ($plist_version) がタグ ($core) と一致しません"
+            exit 1
+          fi
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$cargo_version" != "$core" ]; then
+            echo "::error::Cargo.tomlのworkspace version ($cargo_version) がタグ ($core) と一致しません"
+            exit 1
+          fi
+
+      - name: Cache Cargo dependencies and build artifacts
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-release-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-rust-release-
+            ${{ runner.os }}-${{ runner.arch }}-rust-macos-
+
+      - name: Show build environment
+        run: |
+          rustc --version
+          cargo --version
+          swiftc --version
+          xcodebuild -version
+
+      - name: Test workspace
+        run: cargo test --workspace --all-targets
+
+      - name: Build app and run Swift/UniFFI self-test
+        run: ./app/macos/build-macos-app.sh
+
+      - name: Verify built bundle
+        run: |
+          set -eu
+          app="app/macos/build/ClipboardHistory.app"
+          test -x "$app/Contents/MacOS/ClipboardHistory"
+          test -f "$app/Contents/Frameworks/libclipboard_ffi.dylib"
+          # bundle内のdylibだけを参照し、build machine固有のパスを残さないこと
+          if otool -L "$app/Contents/MacOS/ClipboardHistory" | grep -q "$PWD/target"; then
+            echo "::error::実行ファイルがbuild treeへの絶対パスを参照しています"
+            otool -L "$app/Contents/MacOS/ClipboardHistory"
+            exit 1
+          fi
+          lipo -archs "$app/Contents/MacOS/ClipboardHistory"
+
+      - name: Package unsigned app
+        id: package
+        run: |
+          set -eu
+          asset="${{ steps.meta.outputs.asset }}"
+          ditto -c -k --sequesterRsrc --keepParent \
+            app/macos/build/ClipboardHistory.app \
+            "app/macos/build/$asset"
+          checksum=$(shasum -a 256 "app/macos/build/$asset" | awk '{print $1}')
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+
+      - name: Compose release notes
+        run: |
+          set -eu
+          cat > release-notes.md <<'NOTES'
+          > [!WARNING]
+          > このビルドは**署名もnotarizationもされていません**。Apple Silicon (arm64) 専用です。
+          > 内容を確認できない場合はインストールしないでください。
+
+          ## インストール
+
+          ```sh
+          unzip ${{ steps.meta.outputs.asset }}
+          xattr -d com.apple.quarantine ClipboardHistory.app
+          mv ClipboardHistory.app /Applications/
+          open /Applications/ClipboardHistory.app
+          ```
+
+          menu barにアイコンが出ます。`LSUIElement`のためウィンドウは開きません。
+
+          履歴は次へ平文で保存されます。
+
+          ```text
+          ~/Library/Application Support/ClipboardHistory/
+          ```
+
+          ## SHA-256
+
+          ```text
+          ${{ steps.package.outputs.checksum }}  ${{ steps.meta.outputs.asset }}
+          ```
+
+          ## 変更点と既知の問題
+
+          [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ steps.meta.outputs.tag }}/CHANGELOG.md)を参照してください。
+          NOTES
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            "app/macos/build/${{ steps.meta.outputs.asset }}" \
+            --title "${{ steps.meta.outputs.tag }}" \
+            --notes-file release-notes.md \
+            --generate-notes \
+            ${{ steps.meta.outputs.prerelease == 'true' && '--prerelease' || '' }}

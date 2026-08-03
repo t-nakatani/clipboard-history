@@ -97,6 +97,21 @@ Rustは意味のある境界だけを残した3クレート構成です。
 - XcodeまたはXcode Command Line Tools
 - Swift 5.9以降
 
+## インストール
+
+[Releases](https://github.com/t-nakatani/clipboard-history/releases)からApple Silicon向けのunsigned buildを入手できます。署名もnotarizationもされていないため、macOSは初回起動を隔離で止めます。内容を確認できない場合はインストールせず、ソースからビルドしてください。
+
+```sh
+unzip ClipboardHistory-<tag>-macos-arm64-unsigned.zip
+xattr -d com.apple.quarantine ClipboardHistory.app
+mv ClipboardHistory.app /Applications/
+open /Applications/ClipboardHistory.app
+```
+
+menu barにアイコンが出ます。`LSUIElement`のためウィンドウは開きません。Releaseに記載のSHA-256とダウンロードしたzipの`shasum -a 256`が一致することを確認してください。
+
+Intel Macは対象外です。
+
 ## ビルドと実行
 
 Rust workspaceのテストを実行します。
@@ -131,6 +146,12 @@ GitHub Actionsではpush、pull request、手動実行に対して次を検証�
 - unsigned appの7日間artifact保存
 
 Rust toolchainは[rust-toolchain.toml](rust-toolchain.toml)で1.95.0へ固定しています。`rusqlite 0.40`のbundled SQLite buildが利用する`cfg_select!`に対応するためです。CargoとGitHub Actionsの更新はDependabotが毎週確認します。
+
+## リリース
+
+`v`で始まるタグをpushすると[release workflow](.github/workflows/release.yml)がmacOS 14でappをビルドし、unsigned zipとSHA-256を添えてGitHub Releaseを作成します。タグのversion coreは`Info.plist`の`CFBundleShortVersionString`とworkspace versionに一致している必要があり、ずれている場合はbuild前に失敗します。pre-release識別子を含むタグはprereleaseとして公開されます。
+
+変更履歴と既知の問題は[CHANGELOG.md](CHANGELOG.md)で管理します。
 
 ## UIの調整
 
@@ -179,3 +200,7 @@ clipboard-history/
 3. 画像込み100,000件でアプリ全体のRSSと描画時間を測定する
 4. global shortcut、エラー表示、設定画面を追加する
 5. ディスク容量retention、pin、配布工程を整備する
+
+## ライセンス
+
+[MIT License](LICENSE)

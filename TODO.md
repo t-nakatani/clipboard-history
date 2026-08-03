@@ -1,6 +1,6 @@
 # TODO
 
-最終更新: 2026-08-02
+最終更新: 2026-08-03
 
 このファイルは、Clipboard Historyを技術PoCから日常利用可能なmacOSアプリへ進めるための残タスクを管理します。
 
@@ -109,12 +109,17 @@
 
 ### macOS配布
 
+- [x] tag pushでunsigned zipを公開するrelease workflowを作る
+- [x] tagとversion metadataの一致をrelease前に強制する
 - [ ] Xcode projectを作成する
 - [ ] Rust libraryをstatic linkへ切り替える
-- [ ] app icon、bundle identifier、versioningを正式化する
+- [ ] app iconを用意し、bundle identifierを正式なものへ変える
 - [ ] Hardened Runtimeとcode signingを設定する
 - [ ] notarizationとstaplingを自動化する
-- [ ] release artifactと更新方式を決める
+- [ ] 更新方式を決める（現在は手動での再ダウンロード）
+- [ ] universal binaryにするかarm64限定を維持するか決める
+
+現状: `v*`タグからApple Silicon向けunsigned buildを公開できます。署名がないため利用者は`xattr -d com.apple.quarantine`を必要とします。これはalphaの受け入れ範囲で、一般配布の前にcode signingとnotarizationを入れます。
 
 ### Accessibilityと品質
 
@@ -132,7 +137,7 @@
 - [x] `cargo test --workspace`
 - [x] Swift/UniFFIセルフテストを含むmacOS build
 - [x] query plan回帰テスト
-- [ ] release buildのartifact検査
+- [x] release buildのartifact検査（実行ファイル、bundled dylib、絶対パス混入、arch）
 
 ## P3: 初期スコープ外
 
