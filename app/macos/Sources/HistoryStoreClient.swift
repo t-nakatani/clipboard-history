@@ -195,7 +195,6 @@ final class HistoryStoreClient {
 
     func searchPage(
         query: String,
-        mode: SearchModeDto,
         cursor: HistoryCursorDto? = nil,
         direction: PageDirectionDto = .older,
         limit: UInt32 = 50,
@@ -205,7 +204,6 @@ final class HistoryStoreClient {
             let result = Result {
                 try engine.searchPage(
                     query: query,
-                    mode: mode,
                     cursor: cursor,
                     direction: direction,
                     limit: limit

@@ -25,12 +25,6 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
     private let previewLoader: ImagePreviewLoader
     private let statusView: HistoryStatusView
     private let tableView = HistoryTableView()
-    private let searchModeControl = NSSegmentedControl(
-        labels: ["完全", "前方", "部分"],
-        trackingMode: .selectOne,
-        target: nil,
-        action: nil
-    )
     private weak var historyClipView: NSClipView?
     /// Set while the list scrolls itself — keyboard selection, or the anchor
     /// put back after a page arrives — so that scrolling does not hand the
@@ -80,22 +74,11 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
             && visibleRows.location > Self.pagingRowMargin
     }
 
-    private var selectedSearchMode: SearchModeDto {
-        switch searchModeControl.selectedSegment {
-        case 0: return .exact
-        case 1: return .prefix
-        default: return .substring
-        }
-    }
-
     // MARK: - View construction
 
     private func buildContents() {
         searchField.placeholderString = "入力して検索"
         searchField.delegate = self
-        searchModeControl.selectedSegment = 2
-        searchModeControl.target = self
-        searchModeControl.action = #selector(searchModeChanged)
 
         let appNameLabel = NSTextField(labelWithString: "Clipboard")
         appNameLabel.font = .systemFont(
@@ -103,11 +86,10 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
             weight: configuration.typography.appNameWeight
         )
         appNameLabel.textColor = .tertiaryLabelColor
-        let searchBar = NSStackView(views: [appNameLabel, searchField, searchModeControl])
+        let searchBar = NSStackView(views: [appNameLabel, searchField])
         searchBar.orientation = .horizontal
         searchBar.spacing = configuration.content.searchItemSpacing
         searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        searchModeControl.setContentHuggingPriority(.required, for: .horizontal)
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("history"))
         column.title = "履歴"
@@ -181,12 +163,8 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
 
     // MARK: - Actions
 
-    @objc private func searchModeChanged() {
-        feed.scheduleSearch(text: searchField.stringValue, mode: selectedSearchMode)
-    }
-
     func controlTextDidChange(_ notification: Notification) {
-        feed.scheduleSearch(text: searchField.stringValue, mode: selectedSearchMode)
+        feed.scheduleSearch(text: searchField.stringValue)
     }
 
     /// The table refuses first responder, so every key arrives here and the

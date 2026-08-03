@@ -122,13 +122,6 @@ pub enum PageDirectionDto {
     Newer,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
-pub enum SearchModeDto {
-    Exact,
-    Prefix,
-    Substring,
-}
-
 #[derive(Debug, uniffi::Error)]
 pub enum ClipboardFfiError {
     Store { message: String },
@@ -344,30 +337,22 @@ impl ClipboardEngine {
     pub fn search(
         &self,
         query: String,
-        mode: SearchModeDto,
         limit: u32,
     ) -> Result<Vec<ClipSummaryDto>, ClipboardFfiError> {
-        self.search_page(query, mode, None, PageDirectionDto::Older, limit)
+        self.search_page(query, None, PageDirectionDto::Older, limit)
             .map(|page| page.items)
     }
 
     pub fn search_page(
         &self,
         query: String,
-        mode: SearchModeDto,
         cursor: Option<HistoryCursorDto>,
         direction: PageDirectionDto,
         limit: u32,
     ) -> Result<HistoryPageDto, ClipboardFfiError> {
-        let mode = match mode {
-            SearchModeDto::Exact => clipboard_core::MatchMode::Exact,
-            SearchModeDto::Prefix => clipboard_core::MatchMode::Prefix,
-            SearchModeDto::Substring => clipboard_core::MatchMode::Substring,
-        };
         self.service
             .search_page(
                 &query,
-                mode,
                 cursor.map(history_cursor),
                 page_direction(direction),
                 limit.clamp(1, 200) as usize,
@@ -648,9 +633,7 @@ mod tests {
         let selected = engine.select(rows[0].id).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].bytes, b"persisted through ffi");
-        let searched = engine
-            .search("persisted".into(), SearchModeDto::Prefix, 50)
-            .unwrap();
+        let searched = engine.search("persisted".into(), 50).unwrap();
         assert_eq!(searched.len(), 1);
         let maintenance = engine
             .run_maintenance(MaintenanceTriggerDto::Periodic)
@@ -716,13 +699,7 @@ mod tests {
         assert!(newer.has_more);
 
         let search = engine
-            .search_page(
-                "page-".into(),
-                SearchModeDto::Prefix,
-                None,
-                PageDirectionDto::Older,
-                2,
-            )
+            .search_page("page-".into(), None, PageDirectionDto::Older, 2)
             .unwrap();
         assert_eq!(search.items.len(), 2);
         assert!(search.has_more);

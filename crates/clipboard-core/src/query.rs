@@ -1,6 +1,10 @@
+/// How the planner asks the index to match a needle.
+///
+/// `Prefix` is answerable by a seek at any needle length. `Substring` needs
+/// three characters before an index can answer it, and falls back to a bounded
+/// recent scan below that.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MatchMode {
-    Exact,
     Prefix,
     Substring,
 }
@@ -16,19 +20,24 @@ pub enum PlannedQuery {
 pub struct QueryPlanner;
 
 impl QueryPlanner {
-    pub fn plan(&self, query: &str, mode: MatchMode) -> PlannedQuery {
+    /// Turns raw search text into the query the repository should run.
+    ///
+    /// Callers pass text, not a match mode: history search is always substring,
+    /// and picking between the modes is the planner's job because only it knows
+    /// what each one costs at a given needle length.
+    pub fn plan(&self, query: &str) -> PlannedQuery {
         let needle = query.trim();
         if needle.is_empty() {
             return PlannedQuery::Empty;
         }
-        if matches!(mode, MatchMode::Exact | MatchMode::Substring) && needle.chars().count() < 3 {
+        if needle.chars().count() < 3 {
             return PlannedQuery::RecentScan {
-                mode,
+                mode: MatchMode::Substring,
                 needle: needle.to_owned(),
             };
         }
         PlannedQuery::Indexed {
-            mode,
+            mode: MatchMode::Substring,
             needle: needle.to_owned(),
         }
     }
@@ -39,27 +48,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn short_non_prefix_queries_keep_mode_in_bounded_recent_scan() {
+    fn needles_below_the_trigram_floor_fall_back_to_a_bounded_recent_scan() {
         assert_eq!(
-            QueryPlanner.plan("ab", MatchMode::Exact),
-            PlannedQuery::RecentScan {
-                mode: MatchMode::Exact,
-                needle: "ab".into(),
-            }
-        );
-        assert_eq!(
-            QueryPlanner.plan("ab", MatchMode::Substring),
+            QueryPlanner.plan("ab"),
             PlannedQuery::RecentScan {
                 mode: MatchMode::Substring,
                 needle: "ab".into(),
             }
         );
-        assert!(matches!(
-            QueryPlanner.plan("ab", MatchMode::Prefix),
+        assert_eq!(
+            QueryPlanner.plan("abc"),
             PlannedQuery::Indexed {
-                mode: MatchMode::Prefix,
-                ..
+                mode: MatchMode::Substring,
+                needle: "abc".into(),
             }
-        ));
+        );
+    }
+
+    #[test]
+    fn blank_text_plans_no_query_at_all() {
+        assert_eq!(QueryPlanner.plan("   "), PlannedQuery::Empty);
     }
 }

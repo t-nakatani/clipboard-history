@@ -7,7 +7,7 @@ import Foundation
 /// field. Naming the state keeps that decision in one place.
 enum HistoryQuery: Equatable {
     case recent
-    case search(text: String, mode: SearchModeDto)
+    case search(text: String)
 }
 
 /// Owns the history feed: which query is live, which pages are resident, and
@@ -91,14 +91,14 @@ final class HistoryFeedModel {
         switch query {
         case .recent:
             loadRecent(keepingDetail: keepingDetail)
-        case let .search(text, mode):
-            search(text: text, mode: mode)
+        case let .search(text):
+            search(text: text)
         }
     }
 
     /// Debounces a query change from the search controls. Empty text falls back
     /// to the recent feed.
-    func scheduleSearch(text: String, mode: SearchModeDto) {
+    func scheduleSearch(text: String) {
         // Typing is activity even though the request is still debounced. Waiting
         // for the timer would leave a window in which the scheduler still
         // believes the app is deep idle and can put an FTS optimize on the store
@@ -109,12 +109,12 @@ final class HistoryFeedModel {
             withTimeInterval: searchDebounce,
             repeats: false
         ) { [weak self] _ in
-            self?.search(text: text, mode: mode)
+            self?.search(text: text)
         }
     }
 
     /// Runs a query change immediately, bypassing the debounce.
-    func search(text: String, mode: SearchModeDto) {
+    func search(text: String) {
         cancelPendingSearch()
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             // `loadRecent` records the activity and takes the next generation.
@@ -127,14 +127,13 @@ final class HistoryFeedModel {
         // The panel is usable while the store is still opening, so a search
         // typed then has to be what `attach`'s reload replays — otherwise the
         // recent feed loads under a search field that still holds text.
-        query = .search(text: text, mode: mode)
+        query = .search(text: text)
         guard let store else { return }
         let issued = generation
         isLoadingPage = true
         statusDidChange?(.searching)
         store.searchPage(
             query: text,
-            mode: mode,
             cursor: nil,
             direction: .older,
             limit: pageSize
@@ -192,10 +191,9 @@ final class HistoryFeedModel {
                 limit: pageSize,
                 completion: completion
             )
-        case let .search(text, mode):
+        case let .search(text):
             store.searchPage(
                 query: text,
-                mode: mode,
                 cursor: cursor,
                 direction: direction,
                 limit: pageSize,

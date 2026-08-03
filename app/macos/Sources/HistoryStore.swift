@@ -32,7 +32,6 @@ protocol HistoryStore: AnyObject {
 
     func searchPage(
         query: String,
-        mode: SearchModeDto,
         cursor: HistoryCursorDto?,
         direction: PageDirectionDto,
         limit: UInt32,
