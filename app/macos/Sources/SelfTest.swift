@@ -678,10 +678,70 @@ private func layoutStatusRow() -> Int32 {
     return 0
 }
 
+/// Covers what deleting a row does to the rows around it.
+func runDeleteSelfTest() -> Int32 {
+    let store = StubHistoryStore(
+        recentPageResult: fixturePage(ids: [5, 4, 3, 2, 1], hasMore: true),
+        searchPageResult: fixturePage(ids: [])
+    )
+    let feed = HistoryFeedModel(store: store, onStoreActivity: {})
+    feed.reload()
+    guard feed.rows.map(\.id) == [5, 4, 3, 2, 1] else {
+        fputs("feed did not load the recent page\n", stderr)
+        return 1
+    }
+
+    // `reset` is what makes the list drop its scroll anchor, so it is the flag
+    // that decides whether a delete costs the reader their place.
+    var resets: [Bool] = []
+    feed.updateRows = { reset, apply in
+        resets.append(reset)
+        apply()
+    }
+
+    let loadsBeforeDelete = store.recentPageCalls
+    feed.delete(id: 3)
+
+    guard feed.rows.map(\.id) == [5, 4, 2, 1] else {
+        fputs("delete did not remove the row: \(feed.rows.map(\.id))\n", stderr)
+        return 1
+    }
+    guard resets == [false] else {
+        fputs("delete replaced the whole window instead of dropping one row\n", stderr)
+        return 1
+    }
+    guard store.recentPageCalls == loadsBeforeDelete else {
+        fputs("delete reloaded from the newest edge, throwing the reader back to the top\n", stderr)
+        return 1
+    }
+    guard feed.hasMoreOlder else {
+        fputs("delete discarded the window's older paging edge\n", stderr)
+        return 1
+    }
+
+    // Deleting the last resident row leaves nothing to derive an anchor from,
+    // which is the one case that still has to go back to the store.
+    store.recentPageResult = fixturePage(ids: [9])
+    for id: Int64 in [5, 4, 2, 1] {
+        feed.delete(id: id)
+    }
+    guard store.recentPageCalls > loadsBeforeDelete else {
+        fputs("emptying the window by deleting did not reload\n", stderr)
+        return 1
+    }
+    guard feed.rows.map(\.id) == [9] else {
+        fputs("the reload after an emptied window did not restock the rows\n", stderr)
+        return 1
+    }
+
+    return 0
+}
+
 func runSelfTest() -> Int32 {
     let stages: [(String, () -> Int32)] = [
         ("bindings", runBindingSelfTest),
         ("history feed", runHistoryFeedSelfTest),
+        ("delete", runDeleteSelfTest),
         ("status row", runStatusRowSelfTest),
     ]
     for (name, stage) in stages {
