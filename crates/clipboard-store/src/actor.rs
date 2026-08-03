@@ -1450,6 +1450,39 @@ mod tests {
     }
 
     #[test]
+    fn recover_orphans_survives_malformed_payload_file_names() {
+        let root = unique_test_root("clipboard-malformed-orphan-test");
+        let options = StoreOptions::new(root.join("history.sqlite"), root.join("payloads"));
+        let store = StoreHandle::open(options.clone()).unwrap();
+
+        let payloads = PayloadStore::new(&options.payload_directory);
+        let orphan = payloads.put(b"unreferenced payload").unwrap();
+        let dir = orphan.path.parent().unwrap().to_path_buf();
+        // 64-byte multibyte UTF-8 name: previously panicked the actor thread.
+        std::fs::write(dir.join("é".repeat(32)), b"junk").unwrap();
+        std::fs::write(dir.join("not-a-hash"), b"junk").unwrap();
+        // Non-UTF-8 name; some filesystems (e.g. APFS) refuse to create such
+        // names, so this part is best effort.
+        #[cfg(unix)]
+        {
+            use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+            let mut raw = vec![b'a'; 63];
+            raw.push(0xff);
+            let _ = std::fs::write(dir.join(OsStr::from_bytes(&raw)), b"junk");
+        }
+
+        let stats = store.recover_orphans().unwrap();
+        assert_eq!(stats.orphan_files_deleted, 1);
+        assert!(!payloads.path_for(orphan.hash).exists());
+
+        // The actor is still alive and the store remains usable.
+        assert!(store.recent(10).unwrap().is_empty());
+        store.shutdown().unwrap();
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn clean_shutdown_removes_marker_and_skips_next_recovery() {
         let root = unique_test_root("clipboard-clean-shutdown-test");
         let options = StoreOptions::new(root.join("history.sqlite"), root.join("payloads"));
