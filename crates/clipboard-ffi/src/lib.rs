@@ -21,6 +21,15 @@ pub struct CaptureResultDto {
     pub inserted: bool,
 }
 
+/// The capture size limits, published so the Swift layer can drop an oversized
+/// snapshot before copying its bytes across the FFI boundary. The engine still
+/// enforces the same limits itself; this only avoids the wasted copy.
+#[derive(Clone, Copy, Debug, uniffi::Record)]
+pub struct CaptureLimitsDto {
+    pub max_representation_bytes: u64,
+    pub max_clip_bytes: u64,
+}
+
 /// Distinguishes a persisted capture from one rejected by the size limits, so
 /// the Swift layer can handle rejection deliberately instead of seeing an
 /// opaque error.
@@ -166,6 +175,14 @@ impl ClipboardEngine {
             service: HistoryService::new(repository, SearchTextPolicy::default())
                 .with_capture_limits(capture_limits),
         }))
+    }
+
+    pub fn capture_limits(&self) -> CaptureLimitsDto {
+        let limits = self.service.capture_limits();
+        CaptureLimitsDto {
+            max_representation_bytes: limits.max_representation_bytes as u64,
+            max_clip_bytes: limits.max_clip_bytes as u64,
+        }
     }
 
     pub fn startup_recovery_required(&self) -> bool {
@@ -604,7 +621,11 @@ mod tests {
             bytes: b"persisted through ffi".to_vec(),
         };
 
-        let inserted = stored(engine.capture(vec![representation.clone()], None, 10).unwrap());
+        let inserted = stored(
+            engine
+                .capture(vec![representation.clone()], None, 10)
+                .unwrap(),
+        );
         assert!(inserted.inserted);
         let preview = RepresentationDto {
             uti: "public.png".into(),
@@ -790,6 +811,29 @@ mod tests {
             payload_files.is_empty(),
             "unexpected payload files: {payload_files:?}"
         );
+
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ffi_publishes_capture_limits_matching_the_restore_limit() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-ffi-limits-test-{unique}"));
+        let engine = ClipboardEngine::open(
+            root.join("history.sqlite").to_string_lossy().into_owned(),
+            root.join("payloads").to_string_lossy().into_owned(),
+        )
+        .unwrap();
+
+        let limits = engine.capture_limits();
+        let restore_limit = StoreOptions::new(root.join("history.sqlite"), root.join("payloads"))
+            .max_restore_bytes as u64;
+        assert_eq!(limits.max_representation_bytes, restore_limit);
+        assert_eq!(limits.max_clip_bytes, restore_limit);
 
         drop(engine);
         std::fs::remove_dir_all(root).unwrap();

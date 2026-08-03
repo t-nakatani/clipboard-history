@@ -17,6 +17,7 @@ enum HistoryStatus {
     case captured(inserted: Bool, residentCount: Int)
     case newerAvailable
     case rejected(CaptureFilterDecisionDto)
+    case rejectedOversized(CaptureRejectionReason)
     case loaded(count: Int, newestPreview: String?, keepsDetail: Bool)
     case searching
     case searchCompleted(count: Int)
@@ -37,7 +38,9 @@ enum HistoryStatus {
 
     var priority: Priority {
         switch self {
-        case .recoveryRebuilt, .recoveryFailed, .failed:
+        // A silently missing clip is confusing, so the explanation has to
+        // survive until the user next opens the panel.
+        case .recoveryRebuilt, .recoveryFailed, .failed, .rejectedOversized:
             return .important
         default:
             return .routine
@@ -68,6 +71,8 @@ enum HistoryStatus {
             return "新しい履歴あり"
         case .rejected:
             return "保存対象外"
+        case .rejectedOversized:
+            return "サイズ上限を超えるため保存対象外"
         case let .loaded(count, _, _):
             return "履歴 \(count)件を読み込み済み"
         case .searching:
@@ -99,11 +104,7 @@ enum HistoryStatus {
         case let .recoveryFailed(description):
             return description
         case let .capturing(types, payloadBytes):
-            let size = ByteCountFormatter.string(
-                fromByteCount: Int64(payloadBytes),
-                countStyle: .file
-            )
-            return "\(Self.readableKind(for: types)) · \(size)"
+            return "\(Self.readableKind(for: types)) · \(Self.readableBytes(payloadBytes))"
         case let .captured(_, residentCount):
             return "履歴 \(residentCount)件"
         case .newerAvailable:
@@ -117,6 +118,18 @@ enum HistoryStatus {
             case .accept:
                 return nil
             }
+        case let .rejectedOversized(reason):
+            let observed: UInt64
+            let limit: UInt64
+            let subject: String
+            switch reason {
+            case let .oversizedRepresentation(observedBytes, limitBytes):
+                (observed, limit, subject) = (observedBytes, limitBytes, "形式のひとつ")
+            case let .oversizedClip(observedBytes, limitBytes):
+                (observed, limit, subject) = (observedBytes, limitBytes, "内容全体")
+            }
+            return "\(subject)が \(Self.readableBytes(observed)) で、"
+                + "上限 \(Self.readableBytes(limit)) を超えています。復元できないため保存しませんでした。"
         case let .loaded(_, newestPreview, keepsDetail):
             guard !keepsDetail else { return nil }
             return newestPreview ?? "履歴はまだありません"
@@ -129,6 +142,10 @@ enum HistoryStatus {
         case let .failed(error):
             return error.localizedDescription
         }
+    }
+
+    private static func readableBytes<Value: BinaryInteger>(_ bytes: Value) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .file)
     }
 
     /// Plain-language equivalent of the captured UTI list for the status row.

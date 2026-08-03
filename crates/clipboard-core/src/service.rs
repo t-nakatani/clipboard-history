@@ -61,6 +61,10 @@ impl<R: HistoryRepository> HistoryService<R> {
         &self.repository
     }
 
+    pub fn capture_limits(&self) -> CaptureLimits {
+        self.capture_limits
+    }
+
     pub fn select(&self, id: crate::ClipId) -> Result<Vec<Representation>, R::Error> {
         self.repository.representations(id)
     }

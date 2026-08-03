@@ -415,6 +415,58 @@ func runHistoryFeedSelfTest() -> Int32 {
         return 1
     }
 
+    // The Swift-side size check must agree with the engine's, since a drift
+    // would silently drop clips the engine would have accepted.
+    let limits = CaptureLimitsDto(maxRepresentationBytes: 8, maxClipBytes: 12)
+    func representation(_ byteCount: Int) -> RepresentationDto {
+        RepresentationDto(
+            uti: "public.utf8-plain-text",
+            bytes: Data(repeating: 0x61, count: byteCount)
+        )
+    }
+    guard limits.rejection(for: [representation(8)]) == nil else {
+        fputs("the capture size check rejected a representation at the limit\n", stderr)
+        return 1
+    }
+    guard case .oversizedRepresentation = limits.rejection(for: [representation(9)]) else {
+        fputs("the capture size check accepted an oversized representation\n", stderr)
+        return 1
+    }
+    guard limits.rejection(for: [representation(6), representation(6)]) == nil else {
+        fputs("the capture size check rejected a clip at the total limit\n", stderr)
+        return 1
+    }
+    guard case .oversizedClip = limits.rejection(for: [representation(7), representation(6)]) else {
+        fputs("the capture size check accepted a clip over the total limit\n", stderr)
+        return 1
+    }
+
+    // An oversized clip leaves the rows untouched but must still explain itself,
+    // otherwise the clip just silently never appears.
+    feed.shouldHoldNewestUpdate = { false }
+    let rowsBeforeRejection = feed.rows.map(\.id)
+    store.captureResult = PersistedCapture.rejected(
+        reason: .oversizedClip(observedBytes: 70_000_000, limitBytes: 67_108_864)
+    )
+    statuses.removeAll()
+    feed.capture(candidate)
+    guard feed.rows.map(\.id) == rowsBeforeRejection else {
+        fputs("a rejected oversized capture disturbed the rows\n", stderr)
+        return 1
+    }
+    guard case .rejectedOversized = statuses.last else {
+        fputs("a rejected oversized capture did not reach the status row\n", stderr)
+        return 1
+    }
+    guard statuses.last?.priority == .important, statuses.last?.detail != nil else {
+        fputs("an oversized rejection was not surfaced with an explanation\n", stderr)
+        return 1
+    }
+    store.captureResult = PersistedCapture.stored(
+        result: CaptureResultDto(id: 5, inserted: true),
+        recentPage: fixturePage(ids: [5, 4, 3, 2, 1])
+    )
+
     // While a search is live, a capture re-runs the search instead of jumping
     // back to the recent feed.
     feed.search(text: "item", mode: .substring)

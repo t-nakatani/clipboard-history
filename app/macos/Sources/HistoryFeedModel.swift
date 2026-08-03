@@ -225,8 +225,9 @@ final class HistoryFeedModel {
                 ))
                 self.absorb(recentPage: recentPage)
             case let .success(.rejected(reason)):
-                // Oversized clips are dropped on purpose; keep the feed as is.
-                NSLog("clipboard capture rejected: %@", reason)
+                // Nothing was stored, so the rows stay as they are; the status
+                // row is the only place the user learns why.
+                self.statusDidChange?(.rejectedOversized(reason))
             case let .failure(error):
                 self.statusDidChange?(.failed(error))
             }
