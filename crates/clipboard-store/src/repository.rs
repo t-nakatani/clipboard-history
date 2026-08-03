@@ -400,14 +400,19 @@ fn search_prefix_page(
     let fetch_limit = (limit + 1) as i64;
     // rusqlite requires every named parameter to exist in both SQL variants.
     // The NULL guard keeps `:key` present when the expression index uses LIKE.
+    // LIKE ignores collation entirely, so NOCASE is not what makes the match
+    // case-insensitive here; the case_sensitive_like pragma is. It is what lets
+    // both variants seek idx_clips_text_prefix, which is collated the same way.
+    // The equality variant does need it for correctness as well.
     let (prefix_clause, key) = if needle.chars().count() <= 64 {
         (
-            ":key IS NULL AND substr(c.normalized_text, 1, 64) LIKE :pattern ESCAPE '\\'",
+            ":key IS NULL
+             AND substr(c.normalized_text, 1, 64) COLLATE NOCASE LIKE :pattern ESCAPE '\\'",
             None,
         )
     } else {
         (
-            "substr(c.normalized_text, 1, 64) = :key",
+            "substr(c.normalized_text, 1, 64) COLLATE NOCASE = :key",
             Some(needle.chars().take(64).collect::<String>()),
         )
     };
@@ -599,15 +604,35 @@ mod tests {
             &connection,
             "EXPLAIN QUERY PLAN
              SELECT id FROM clips
-             WHERE substr(normalized_text, 1, 64) LIKE ?1 ESCAPE '\\'
+             WHERE substr(normalized_text, 1, 64) COLLATE NOCASE LIKE ?1 ESCAPE '\\'
                AND normalized_text LIKE ?1 ESCAPE '\\'
              ORDER BY last_used_at DESC, id DESC
              LIMIT ?2",
             params!["alpha%", 50_i64],
         );
+        // A case-insensitive LIKE can only seek an index collated the same way,
+        // so a plain SCAN here means the NOCASE collation drifted apart.
         assert!(
-            prefix_plan.contains("idx_clips_text_prefix"),
+            prefix_plan.contains("SEARCH clips USING INDEX idx_clips_text_prefix"),
             "prefix expression index missing: {prefix_plan}"
+        );
+
+        // Needles longer than 64 characters compare the indexed prefix for
+        // equality instead. Dropping the collation there still returns the right
+        // rows, so only the plan can catch it falling back to a recency scan.
+        let long_prefix_plan = explain(
+            &connection,
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM clips
+             WHERE substr(normalized_text, 1, 64) COLLATE NOCASE = ?1
+               AND normalized_text LIKE ?2 ESCAPE '\\'
+             ORDER BY last_used_at DESC, id DESC
+             LIMIT ?3",
+            params!["alpha".repeat(13), "alpha%", 50_i64],
+        );
+        assert!(
+            long_prefix_plan.contains("SEARCH clips USING INDEX idx_clips_text_prefix"),
+            "prefix equality seek missing: {long_prefix_plan}"
         );
 
         let substring_plan = explain(
@@ -620,6 +645,10 @@ mod tests {
              LIMIT ?2",
             params!["%alpha%", 50_i64],
         );
+        // Weak on purpose: fts5 reports "VIRTUAL TABLE INDEX 0:" for a full scan
+        // too, and only appends "L0" when it takes the LIKE over into the
+        // trigram index. The ESCAPE clause currently stops that from happening,
+        // so this only asserts the query still reaches the fts5 module at all.
         assert!(
             substring_plan.contains("VIRTUAL TABLE INDEX"),
             "FTS5 virtual index missing: {substring_plan}"

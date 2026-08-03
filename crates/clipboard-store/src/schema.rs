@@ -2,7 +2,16 @@ use rusqlite::Connection;
 
 use crate::StoreError;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+
+// Search ignores case, so the prefix seek has to be collated the same way the
+// LIKE comparison is. Shared by the fresh install and the version 4 migration so
+// the index the planner sees cannot drift from the one the queries ask for.
+const PREFIX_INDEX_SQL: &str = "
+    CREATE INDEX idx_clips_text_prefix
+        ON clips(substr(normalized_text, 1, 64) COLLATE NOCASE)
+        WHERE normalized_text IS NOT NULL;
+";
 
 // Shared by the fresh install and the version 3 migration so the two paths
 // cannot drift. The triggers count deleted text rows because FTS5 only marks
@@ -41,7 +50,13 @@ pub fn configure_connection(connection: &Connection, cache_kib: usize) -> Result
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     connection.pragma_update(None, "cache_size", -(cache_kib as i64))?;
     connection.pragma_update(None, "mmap_size", 0)?;
-    connection.pragma_update(None, "case_sensitive_like", "ON")?;
+    // LIKE stays case-insensitive (the SQLite default) because searching the
+    // history for "http" must find "HTTP". This pragma is what decides it for
+    // every LIKE predicate, and it only folds ASCII. The one search predicate
+    // that is not a LIKE -- the indexed prefix equality for needles longer than
+    // 64 characters -- carries an explicit NOCASE collation to match, as does
+    // idx_clips_text_prefix so that the seek survives.
+    connection.pragma_update(None, "case_sensitive_like", "OFF")?;
     // Clipboard history holds secrets, so freed pages must not keep plaintext.
     // secure_delete makes SQLite zero deleted content in clips, representations,
     // clip_previews and the FTS index instead of only unlinking it from the
@@ -122,9 +137,6 @@ pub fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
                 ON clips(last_used_at DESC, id DESC);
             CREATE INDEX idx_clips_retention
                 ON clips(pinned, last_used_at, id);
-            CREATE INDEX idx_clips_text_prefix
-                ON clips(substr(normalized_text, 1, 64))
-                WHERE normalized_text IS NOT NULL;
             CREATE INDEX idx_representations_payload
                 ON representations(payload_hash)
                 WHERE payload_hash IS NOT NULL;
@@ -168,6 +180,7 @@ pub fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
             END;
             ",
         )?;
+        transaction.execute_batch(PREFIX_INDEX_SQL)?;
         transaction.execute_batch(MAINTENANCE_STATE_SQL)?;
         transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         transaction.commit()?;
@@ -213,6 +226,17 @@ pub fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         // across restarts, so the counter is a table rather than in-memory state.
         let transaction = connection.transaction()?;
         transaction.execute_batch(MAINTENANCE_STATE_SQL)?;
+        transaction.pragma_update(None, "user_version", 4)?;
+        transaction.commit()?;
+        version = 4;
+    }
+    if version == 4 {
+        // The prefix index was built with the default BINARY collation, which a
+        // case-insensitive LIKE cannot seek. Rebuilding it under NOCASE is what
+        // keeps prefix search off a full table scan.
+        let transaction = connection.transaction()?;
+        transaction.execute_batch("DROP INDEX IF EXISTS idx_clips_text_prefix;")?;
+        transaction.execute_batch(PREFIX_INDEX_SQL)?;
         transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         transaction.commit()?;
         version = CURRENT_SCHEMA_VERSION;
@@ -259,6 +283,18 @@ mod tests {
             .pragma_query_value(None, "secure_delete", |row| row.get(0))
             .unwrap();
         assert_eq!(secure_delete, 1);
+    }
+
+    #[test]
+    fn configured_connections_compare_text_without_case() {
+        let connection = Connection::open_in_memory().unwrap();
+        configure_connection(&connection, 1024).unwrap();
+        // Case-insensitive search rests on this per-connection pragma, so it is
+        // worth pinning next to the connection setup and not only end to end.
+        let matches_ignoring_case: i64 = connection
+            .query_row("SELECT 'A' LIKE 'a'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(matches_ignoring_case, 1);
     }
 
     #[test]
@@ -478,12 +514,54 @@ mod tests {
     }
 
     #[test]
+    fn version_four_database_recollates_the_prefix_index() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE clips (id INTEGER PRIMARY KEY, normalized_text TEXT);
+                 CREATE INDEX idx_clips_text_prefix
+                     ON clips(substr(normalized_text, 1, 64))
+                     WHERE normalized_text IS NOT NULL;
+                 INSERT INTO clips(id, normalized_text) VALUES (1, 'Alpha');
+                 PRAGMA user_version=4;",
+            )
+            .unwrap();
+        migrate(&mut connection).unwrap();
+
+        let definition: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_clips_text_prefix'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            definition.contains("COLLATE NOCASE"),
+            "the migrated prefix index is still case-sensitive: {definition}"
+        );
+        // The rebuild has to carry the existing rows over, not just the shape.
+        // INDEXED BY forces the read through the index; without it the planner
+        // scans this one-row table and the assertion would pass on an empty
+        // index. The NOT NULL term is required because the index is partial.
+        let hits: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM clips INDEXED BY idx_clips_text_prefix
+                 WHERE normalized_text IS NOT NULL
+                   AND substr(normalized_text, 1, 64) COLLATE NOCASE LIKE 'alph%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1);
+    }
+
+    #[test]
     fn version_one_database_gains_preview_table() {
         let mut connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
                 "PRAGMA foreign_keys=ON;
-                 CREATE TABLE clips (id INTEGER PRIMARY KEY);
+                 CREATE TABLE clips (id INTEGER PRIMARY KEY, normalized_text TEXT);
                  PRAGMA user_version=1;",
             )
             .unwrap();
