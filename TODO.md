@@ -1,6 +1,6 @@
 # TODO
 
-最終更新: 2026-08-02
+最終更新: 2026-08-03
 
 このファイルは、Clipboard Historyを技術PoCから日常利用可能なmacOSアプリへ進めるための残タスクを管理します。
 
@@ -16,12 +16,50 @@
 
 ### ユーザーへ見えるエラー表示
 
-- [ ] panel内の固定領域を増やさないtoast/overlayを実装する
-- [ ] store初期化、capture、restore、delete、searchの失敗を表示する
-- [ ] concealed/transient拒否は必要な場合だけ静かに通知する
-- [ ] VoiceOver向けaccessibility announcementを追加する
+このアプリの価値は「コピーしたものは全部ここにある」という信頼です。守るべきは、保存されなかったのにされたと思い込んでいる状態を作らないこと。ユーザーはコピー元を閉じた後にそれを発見します。ここがP0である理由はその一点で、見た目の丁寧さではありません。
 
-完了条件: 主要操作が失敗した理由を、表示密度を損なわず確認できる。
+土台は実装済みです。panel下部に固定高1行のstatus rowがあり（`HistoryStatusView`）、状態は`HistoryStatus` enumで表して文言はview層に置いています。store初期化、capture、restore、delete、search、pagingの失敗はすでに`HistoryStatus.failed`へ流れ、`Priority.important`はpanelが閉じている間に発生しても保持されて後続のroutineな更新に埋もれません。
+
+方針: 失敗はpanelを開いた時に届けます。menu barアイコンでの常時通知や、他アプリへ割り込む通知は使いません。エラーの分類はRust、提示と文言はアプリレイヤーに閉じます。
+
+以下は独立して着手・完了できる3つの塊で、順序の依存はありません。
+
+#### 開いた時に届く失敗通知
+
+`hasUnseenImportantStatus`と`markSeen()`が機構としては既にあるため、残りは挙動の決定と調整です。
+
+- [ ] panelを閉じている間に複数回失敗したとき、最新1件へ件数を添えて示す（現在は`show()`が上書きし、最後の1件しか残らない）
+- [ ] `markSeen()`が可視になった瞬間に既読とする挙動を見直す（履歴を探すために開いてfooterを読まずに閉じると消える）
+- [ ] 未読のimportantがある間はstatus rowを一時的に強調し、固定領域は増やさない
+- [ ] 強調の解除条件を決める（既読、次の操作、時間経過のいずれか）
+- [ ] 閉じている間の失敗が次に開いたときへ持ち越されることを、`SelfTest`の既存のclosed/openケースへ追加して回帰テストする
+
+完了条件: panelを閉じている間に起きた失敗が、次に開いたときへ必ず一度は届く。
+
+#### エラー分類をFFI境界で保つ
+
+- [ ] `ClipboardFfiError`を`StoreError`のvariantへ対応させる（現在は`Store { message: String }`へ潰れている）
+- [ ] `ActorStopped`（以降すべて失敗する。再起動が要る）と`InvalidData`（その1件だけ壊れている）をSwiftが`switch`で区別できるようにする
+- [ ] Swift側はエラー文字列を判定しない。分類はRust、提示はアプリレイヤーという線引きを保つ
+- [ ] 回復不能な失敗と単発の失敗で、ユーザーへ促す次の行動を変える
+- [ ] 対応付けのないvariantへ落ちたときのfallbackと、原文の残し方を決める
+
+完了条件: 再起動が必要な失敗と、その1件だけの失敗を、ユーザーが区別できる。
+
+#### 通知の信号対雑音比
+
+繰り返し出る通知は読まれなくなり、読まれない通知は他の項目の投資も無駄にします。何を出さないかを決める塊です。
+
+- [ ] concealed/transient拒否を必要な場合だけに絞る（現在は拒否のたびに「保存対象外」を出す）
+- [ ] 抑制ルールを決める（初回だけ、panelが開いているときだけ、など）
+- [ ] サイズ超過拒否（`rejectedOversized`、important扱いで実装済み）との出し分けを明文化する
+- [ ] password managerから連続でcopyしても通知が積み上がらないことをテストする
+- [ ] 画像preview取得の失敗を表示する（現在は`HistoryFeedModel.imagePreview`が`try?`で捨てており、thumbnailが出ない理由が伝わらない）
+- [ ] 同じ失敗が連続したときに同一通知を繰り返さない抑制を入れる
+
+background maintenanceとclean shutdownの失敗は`NSLog`のままにします。ユーザーに打つ手がなく、データも失われず、shutdownの失敗は次回起動時のrecoveryが吸収するためです。
+
+完了条件: 表示される通知がすべて行動に結びつき、日常のcopyで邪魔にならない。
 
 ### アプリ統合ベンチマーク
 
@@ -124,6 +162,10 @@
 - [ ] light/dark appearanceを検証する
 - [ ] AppKit UI testと実Pasteboard integration testを追加する
 - [ ] schema migrationを実DB fixtureで回帰テストする
+- [ ] status rowとエラー通知の更新時に`NSAccessibility.post(element:notification:.announcementRequested)`を発行する
+- [ ] `HistoryStatus.Priority`をannouncementのpriorityへ対応付け、routineな更新で読み上げを溢れさせない
+- [ ] `HistoryStatus.failed`のdetailを日本語の説明文へ対応付ける（現在は`error.localizedDescription`のまま、Rust/UniFFI由来の英語が出る）
+- [ ] 再試行できる失敗とできない失敗を文言で区別する
 
 ### CI
 
