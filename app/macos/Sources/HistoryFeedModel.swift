@@ -218,12 +218,15 @@ final class HistoryFeedModel {
         ) { [weak self] result in
             guard let self else { return }
             switch result {
-            case let .success(capture):
+            case let .success(.stored(result, recentPage)):
                 self.statusDidChange?(.captured(
-                    inserted: capture.result.inserted,
-                    residentCount: capture.recentPage.items.count
+                    inserted: result.inserted,
+                    residentCount: recentPage.items.count
                 ))
-                self.absorb(capture)
+                self.absorb(recentPage: recentPage)
+            case let .success(.rejected(reason)):
+                // Oversized clips are dropped on purpose; keep the feed as is.
+                NSLog("clipboard capture rejected: %@", reason)
             case let .failure(error):
                 self.statusDidChange?(.failed(error))
             }
@@ -275,7 +278,7 @@ final class HistoryFeedModel {
     }
 
     /// Decides what a freshly captured clip does to the visible rows.
-    private func absorb(_ capture: PersistedCapture) {
+    private func absorb(recentPage: HistoryPageDto) {
         if case .search = query {
             // The new clip may or may not match; re-running the search is the
             // only way to find out without duplicating the matcher here.
@@ -291,7 +294,7 @@ final class HistoryFeedModel {
         generation += 1
         isLoadingPage = false
         query = .recent
-        apply(page: capture.recentPage, reset: true)
+        apply(page: recentPage, reset: true)
     }
 
     private func loadRecent(keepingDetail: Bool = false) {

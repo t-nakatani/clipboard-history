@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use clipboard_core::{
-    CaptureFilter, CaptureOutcome, ClipKind, ClipboardSnapshot, FilterReason, HistoryRepository,
-    HistoryService, Representation, SearchTextPolicy, canonical_clip_identity,
+    CaptureFilter, CaptureLimits, CaptureOutcome, CaptureRejection, ClipKind, ClipboardSnapshot,
+    FilterReason, HistoryRepository, HistoryService, Representation, SearchTextPolicy,
+    canonical_clip_identity,
 };
 use clipboard_store::{StoreHandle, StoreOptions};
 
@@ -18,6 +19,24 @@ pub struct RepresentationDto {
 pub struct CaptureResultDto {
     pub id: i64,
     pub inserted: bool,
+}
+
+/// Distinguishes a persisted capture from one rejected by the size limits, so
+/// the Swift layer can handle rejection deliberately instead of seeing an
+/// opaque error.
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum CaptureOutcomeDto {
+    Stored {
+        result: CaptureResultDto,
+    },
+    RejectedOversizedRepresentation {
+        observed_bytes: u64,
+        limit_bytes: u64,
+    },
+    RejectedOversizedClip {
+        observed_bytes: u64,
+        limit_bytes: u64,
+    },
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -136,9 +155,16 @@ impl ClipboardEngine {
             });
         }
         let options = StoreOptions::new(database_path, payload_directory);
+        // Capture limits mirror the restore limit so every stored clip is
+        // guaranteed to be restorable.
+        let capture_limits = CaptureLimits {
+            max_representation_bytes: options.max_restore_bytes,
+            max_clip_bytes: options.max_restore_bytes,
+        };
         let repository = StoreHandle::open(options).map_err(store_error)?;
         Ok(Arc::new(Self {
-            service: HistoryService::new(repository, SearchTextPolicy::default()),
+            service: HistoryService::new(repository, SearchTextPolicy::default())
+                .with_capture_limits(capture_limits),
         }))
     }
 
@@ -182,7 +208,7 @@ impl ClipboardEngine {
         representations: Vec<RepresentationDto>,
         image_preview: Option<RepresentationDto>,
         copied_at_ms: i64,
-    ) -> Result<CaptureResultDto, ClipboardFfiError> {
+    ) -> Result<CaptureOutcomeDto, ClipboardFfiError> {
         if representations.is_empty() {
             return Err(ClipboardFfiError::InvalidInput {
                 message: "at least one storage representation is required".into(),
@@ -207,12 +233,28 @@ impl ClipboardEngine {
             )
             .map_err(store_error)?
         {
-            CaptureOutcome::Stored(outcome) => Ok(CaptureResultDto {
-                id: outcome.id.0,
-                inserted: outcome.inserted,
+            CaptureOutcome::Stored(outcome) => Ok(CaptureOutcomeDto::Stored {
+                result: CaptureResultDto {
+                    id: outcome.id.0,
+                    inserted: outcome.inserted,
+                },
             }),
             CaptureOutcome::Empty => Err(ClipboardFfiError::InvalidInput {
                 message: "empty snapshot was not persisted".into(),
+            }),
+            CaptureOutcome::Rejected(CaptureRejection::OversizedRepresentation {
+                observed_bytes,
+                limit_bytes,
+            }) => Ok(CaptureOutcomeDto::RejectedOversizedRepresentation {
+                observed_bytes,
+                limit_bytes,
+            }),
+            CaptureOutcome::Rejected(CaptureRejection::OversizedClip {
+                observed_bytes,
+                limit_bytes,
+            }) => Ok(CaptureOutcomeDto::RejectedOversizedClip {
+                observed_bytes,
+                limit_bytes,
             }),
         }
     }
@@ -562,17 +604,17 @@ mod tests {
             bytes: b"persisted through ffi".to_vec(),
         };
 
-        let inserted = engine
-            .capture(vec![representation.clone()], None, 10)
-            .unwrap();
+        let inserted = stored(engine.capture(vec![representation.clone()], None, 10).unwrap());
         assert!(inserted.inserted);
         let preview = RepresentationDto {
             uti: "public.png".into(),
             bytes: vec![1, 2, 3],
         };
-        let touched = engine
-            .capture(vec![representation], Some(preview.clone()), 20)
-            .unwrap();
+        let touched = stored(
+            engine
+                .capture(vec![representation], Some(preview.clone()), 20)
+                .unwrap(),
+        );
         assert_eq!(touched.id, inserted.id);
         assert!(!touched.inserted);
 
@@ -703,6 +745,80 @@ mod tests {
         drop(recovered);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ffi_rejects_oversized_capture_without_leaving_rows_or_payloads() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("clipboard-ffi-oversized-test-{unique}"));
+        let payloads = root.join("payloads");
+        let engine = ClipboardEngine::open(
+            root.join("history.sqlite").to_string_lossy().into_owned(),
+            payloads.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        let limit = 64 * 1024 * 1024_u64;
+
+        for _ in 0..2 {
+            let outcome = engine
+                .capture(
+                    vec![RepresentationDto {
+                        uti: "public.utf8-plain-text".into(),
+                        bytes: vec![b'x'; limit as usize + 1],
+                    }],
+                    None,
+                    10,
+                )
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                CaptureOutcomeDto::RejectedOversizedRepresentation {
+                    observed_bytes,
+                    limit_bytes,
+                } if observed_bytes == limit + 1 && limit_bytes == limit
+            ));
+        }
+
+        // The rejected capture left no clip rows behind.
+        assert!(engine.recent(50).unwrap().is_empty());
+        // ...and no staged or orphan payload files either.
+        let payload_files: Vec<_> = walk_files(&payloads);
+        assert!(
+            payload_files.is_empty(),
+            "unexpected payload files: {payload_files:?}"
+        );
+
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
+    }
+
+    fn stored(outcome: CaptureOutcomeDto) -> CaptureResultDto {
+        match outcome {
+            CaptureOutcomeDto::Stored { result } => result,
+            other => panic!("expected a stored capture, got {other:?}"),
+        }
     }
 
     fn dto_cursor(item: &ClipSummaryDto) -> HistoryCursorDto {

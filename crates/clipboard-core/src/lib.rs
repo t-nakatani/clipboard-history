@@ -9,7 +9,7 @@ mod service;
 pub use filter::{CaptureFilter, FilterReason};
 pub use identity::canonical_clip_identity;
 pub use model::{
-    CaptureOutcome, ClipCandidate, ClipId, ClipIdentity, ClipKind, ClipSummary, ClipboardSnapshot,
+    CaptureLimits, CaptureOutcome, CaptureRejection, ClipCandidate, ClipId, ClipIdentity, ClipKind, ClipSummary, ClipboardSnapshot,
     HistoryCursor, HistoryPage, ImagePreview, PageDirection, Representation, UpsertOutcome,
 };
 pub use normalize::{SearchTextPolicy, normalize_search_text};

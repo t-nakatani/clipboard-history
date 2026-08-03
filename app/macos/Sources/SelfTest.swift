@@ -188,7 +188,12 @@ func runBindingSelfTest() -> Int32 {
             databasePath: root.appendingPathComponent("history.sqlite").path,
             payloadDirectory: root.appendingPathComponent("payloads").path
         )
-        let stored = try engine!.capture(representations: [text], imagePreview: nil, copiedAtMs: 1)
+        guard case let .stored(stored) = try engine!.capture(
+            representations: [text], imagePreview: nil, copiedAtMs: 1
+        ) else {
+            fputs("Swift capture was not stored through ClipboardEngine\n", stderr)
+            return 1
+        }
         guard stored.inserted, try engine!.recent(limit: 50).count == 1 else {
             fputs("Swift could not persist and read through ClipboardEngine\n", stderr)
             return 1
@@ -227,11 +232,14 @@ func runBindingSelfTest() -> Int32 {
             fputs("ImageIO could not generate bounded clipboard preview\n", stderr)
             return 1
         }
-        let imageStored = try engine!.capture(
+        guard case let .stored(imageStored) = try engine!.capture(
             representations: [imageRepresentation],
             imagePreview: generatedPreview,
             copiedAtMs: 2
-        )
+        ) else {
+            fputs("Swift image capture was not stored through ClipboardEngine\n", stderr)
+            return 1
+        }
         guard
             let loadedPreview = try engine!.imagePreview(id: imageStored.id),
             loadedPreview.bytes == generatedPreview.bytes,
@@ -380,7 +388,7 @@ func runHistoryFeedSelfTest() -> Int32 {
 
     // At the newest edge a capture takes over the rows.
     feed.shouldHoldNewestUpdate = { false }
-    store.captureResult = PersistedCapture(
+    store.captureResult = PersistedCapture.stored(
         result: CaptureResultDto(id: 4, inserted: true),
         recentPage: fixturePage(ids: [4, 3, 2, 1])
     )
@@ -392,7 +400,7 @@ func runHistoryFeedSelfTest() -> Int32 {
 
     // Reading older rows, the same capture must not move anything.
     feed.shouldHoldNewestUpdate = { true }
-    store.captureResult = PersistedCapture(
+    store.captureResult = PersistedCapture.stored(
         result: CaptureResultDto(id: 5, inserted: true),
         recentPage: fixturePage(ids: [5, 4, 3, 2, 1])
     )

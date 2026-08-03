@@ -1,8 +1,9 @@
 import Foundation
 
-struct PersistedCapture {
-    let result: CaptureResultDto
-    let recentPage: HistoryPageDto
+enum PersistedCapture {
+    case stored(result: CaptureResultDto, recentPage: HistoryPageDto)
+    /// The engine rejected the snapshot at the capture boundary (size limits).
+    case rejected(reason: String)
 }
 
 /// Carries the shutdown result off the store queue. The semaphore that guards it
@@ -88,13 +89,26 @@ final class HistoryStoreClient {
                 // ImageIO decode stays off AppKit's main thread. The original
                 // bytes are already present from pasteboard capture.
                 let imagePreview = ImagePreviewGenerator.makePreview(from: representations)
-                let stored = try engine.capture(
+                let outcome = try engine.capture(
                     representations: representations,
                     imagePreview: imagePreview,
                     copiedAtMs: copiedAtMs
                 )
-                let recentPage = try engine.recentPage(cursor: nil, direction: .older, limit: 50)
-                return PersistedCapture(result: stored, recentPage: recentPage)
+                switch outcome {
+                case let .stored(result):
+                    let recentPage = try engine.recentPage(
+                        cursor: nil, direction: .older, limit: 50
+                    )
+                    return PersistedCapture.stored(result: result, recentPage: recentPage)
+                case let .rejectedOversizedRepresentation(observedBytes, limitBytes):
+                    return PersistedCapture.rejected(
+                        reason: "representation of \(observedBytes) bytes exceeds \(limitBytes)"
+                    )
+                case let .rejectedOversizedClip(observedBytes, limitBytes):
+                    return PersistedCapture.rejected(
+                        reason: "clip of \(observedBytes) bytes exceeds \(limitBytes)"
+                    )
+                }
             }
             DispatchQueue.main.async { completion(result) }
         }
