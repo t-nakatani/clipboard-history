@@ -19,6 +19,9 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
     /// A restored clip is the panel's cue to go away. Whoever owns the panel
     /// decides how that happens.
     var dismissPanel: (() -> Void)?
+    /// Reports the `changeCount` a restore wrote, so the owner can tell the
+    /// pasteboard monitor that the change was this app's own.
+    var didWriteToPasteboard: ((Int) -> Void)?
 
     private let configuration: HistoryPanelConfiguration
     private let feed: HistoryFeedModel
@@ -272,7 +275,10 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         statusDidChange?(.restoring)
         feed.representations(for: summary.id) { [weak self] result in
             do {
-                try PasteboardWriter.restore(representations: try result.get())
+                let changeCount = try PasteboardWriter.restore(representations: try result.get())
+                // Claimed before anything else can run, so the monitor knows the
+                // write is ours by the time its next poll comes around.
+                self?.didWriteToPasteboard?(changeCount)
                 self?.statusDidChange?(.restored(preview: summary.preview ?? summary.kind))
                 self?.dismissPanel?()
             } catch {

@@ -56,7 +56,26 @@ final class PasteboardMonitor {
         timer = nil
     }
 
-    private func poll() {
+    /// Reports that `changeCount` was produced by this app writing a restored
+    /// clip back, so the next poll does not read it as something the user
+    /// copied.
+    ///
+    /// Restoring writes the clip's own bytes, so a poll that picked the write up
+    /// would find the identity already stored and record it as a recopy: the
+    /// clip's `copy_count` would climb and it would move to the top of the
+    /// history every time it was used.
+    ///
+    /// The acknowledgement carries the count rather than setting a "skip the
+    /// next one" flag. If the user copies something between the write and the
+    /// poll, the pasteboard has already moved past `changeCount`, and that
+    /// genuine copy is still captured instead of being swallowed by the flag.
+    func acknowledgeSelfWrite(changeCount: Int) {
+        lastChangeCount = changeCount
+    }
+
+    /// Internal rather than private so the self-test can drive a single poll
+    /// against an injected pasteboard instead of waiting on the timer.
+    func poll() {
         let changeCount = pasteboard.changeCount
         guard changeCount != lastChangeCount else { return }
         lastChangeCount = changeCount

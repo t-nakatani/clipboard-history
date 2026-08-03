@@ -205,6 +205,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         listController.statusDidChange = { [weak self] status in self?.show(status) }
         listController.dismissPanel = { [weak panel] in panel?.dismiss() }
+        // The monitor does not exist until the store opens, and neither does
+        // restoring: the feed has no representations to hand out before then.
+        listController.didWriteToPasteboard = { [weak self] changeCount in
+            self?.monitor?.acknowledgeSelfWrite(changeCount: changeCount)
+        }
         panel.contentView = listController.contentView
 
         self.panel = panel

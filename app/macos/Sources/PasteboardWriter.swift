@@ -19,10 +19,17 @@ enum PasteboardRestoreError: LocalizedError {
 }
 
 enum PasteboardWriter {
+    /// Puts a stored clip back on the pasteboard and reports the `changeCount`
+    /// the write produced.
+    ///
+    /// The count is what lets the monitor tell this write apart from a copy the
+    /// user made: writing is indistinguishable from any other pasteboard change
+    /// once it has happened, so the one moment it can be identified is here.
+    @discardableResult
     static func restore(
         representations: [RepresentationDto],
         pasteboard: NSPasteboard = .general
-    ) throws {
+    ) throws -> Int {
         guard !representations.isEmpty else { throw PasteboardRestoreError.empty }
 
         let item = NSPasteboardItem()
@@ -39,5 +46,6 @@ enum PasteboardWriter {
 
         pasteboard.clearContents()
         guard pasteboard.writeObjects([item]) else { throw PasteboardRestoreError.writeFailed }
+        return pasteboard.changeCount
     }
 }
