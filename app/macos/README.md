@@ -15,7 +15,7 @@ SQLiteとpayloadは`~/Library/Application Support/ClipboardHistory/`へ保存し
 
 Rust storeは起動中markerを所有し、clean shutdown時にtruncate checkpointを終えてからmarkerを削除します。前回markerが残っていた場合だけ、recentの初回表示後にbackgroundで`quick_check`、queued GC、orphan scanを実行します。破損を検出した場合はDB、WAL/SHM、payload directoryをtimestamp付きで隔離して空storeを再構築します。複数fileの隔離はdurable manifestで管理し、途中停止時は新DBを開く前に再開します。recoveryが失敗、または実行前に終了した場合はmarkerを残したままにして、次回起動で再試行します。
 
-検索欄は完全一致、前方一致、正確な部分一致の3 modeだけを持ちます。入力は120ms debounceされ、古いgenerationの結果はUIへ反映しません。3文字未満の完全一致・部分一致は1 requestあたり2,000件に制限したscanへ落とし、`truncated` cursorで必要な場合だけ次の窓へ進みます。
+検索欄はmodeを持たず、常に正確な部分一致で検索します。どのmodeで探すかの判断は`QueryPlanner`が引き受け、needle長に応じてindexed searchとbounded scanを選びます。入力は120ms debounceされ、古いgenerationの結果はUIへ反映しません。3文字未満のqueryは1 requestあたり2,000件に制限したscanへ落とし、`truncated` cursorで必要な場合だけ次の窓へ進みます。
 
 画像はcapture時にImageIOで最大96pxのJPEG previewをstore用serial queue上で生成します。previewは原representation、canonical identity、復元payloadから独立しており、最大64KiBです。一覧summaryにはpreview bytesを入れず、表示対象だけを専用APIで非同期取得します。decoded image cacheは最大64件・概算4MiBに制限されます。
 
