@@ -120,4 +120,40 @@ pub struct UpsertOutcome {
 pub enum CaptureOutcome {
     Stored(UpsertOutcome),
     Empty,
+    /// The snapshot violated a capture size limit and was rejected before
+    /// hashing or persistence.
+    Rejected(CaptureRejection),
+}
+
+/// Why a snapshot was rejected at the capture boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureRejection {
+    OversizedRepresentation {
+        observed_bytes: u64,
+        limit_bytes: u64,
+    },
+    OversizedClip {
+        observed_bytes: u64,
+        limit_bytes: u64,
+    },
+}
+
+/// Size limits enforced before a snapshot is hashed or persisted.
+///
+/// `max_clip_bytes` must not exceed the store's restore byte limit so that
+/// every stored clip stays restorable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureLimits {
+    pub max_representation_bytes: usize,
+    pub max_clip_bytes: usize,
+}
+
+impl Default for CaptureLimits {
+    fn default() -> Self {
+        // Mirrors the store's default `max_restore_bytes`.
+        Self {
+            max_representation_bytes: 64 * 1024 * 1024,
+            max_clip_bytes: 64 * 1024 * 1024,
+        }
+    }
 }

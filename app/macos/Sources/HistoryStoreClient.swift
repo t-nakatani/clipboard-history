@@ -1,8 +1,39 @@
 import Foundation
 
-struct PersistedCapture {
-    let result: CaptureResultDto
-    let recentPage: HistoryPageDto
+/// Why a snapshot never became a history row. Carried as data rather than as a
+/// formatted sentence so the wording stays in the view layer.
+enum CaptureRejectionReason {
+    case oversizedRepresentation(observedBytes: UInt64, limitBytes: UInt64)
+    case oversizedClip(observedBytes: UInt64, limitBytes: UInt64)
+}
+
+enum PersistedCapture {
+    case stored(result: CaptureResultDto, recentPage: HistoryPageDto)
+    /// The snapshot violated a capture size limit (either here or in the engine).
+    case rejected(reason: CaptureRejectionReason)
+}
+
+extension CaptureLimitsDto {
+    /// Mirrors the engine's own size check so an oversized snapshot is dropped
+    /// before its bytes are copied across the FFI boundary and before a preview
+    /// is decoded. The engine stays authoritative and repeats the check.
+    func rejection(for representations: [RepresentationDto]) -> CaptureRejectionReason? {
+        var totalBytes: UInt64 = 0
+        for representation in representations {
+            let bytes = UInt64(representation.bytes.count)
+            if bytes > maxRepresentationBytes {
+                return .oversizedRepresentation(
+                    observedBytes: bytes,
+                    limitBytes: maxRepresentationBytes
+                )
+            }
+            totalBytes += bytes
+        }
+        guard totalBytes <= maxClipBytes else {
+            return .oversizedClip(observedBytes: totalBytes, limitBytes: maxClipBytes)
+        }
+        return nil
+    }
 }
 
 /// Carries the shutdown result off the store queue. The semaphore that guards it
@@ -16,6 +47,7 @@ final class HistoryStoreClient {
 
     private let engine: ClipboardEngine
     private let queue = DispatchQueue(label: "dev.clipboard-history.store", qos: .userInitiated)
+    private let captureLimits: CaptureLimitsDto
     let startupRecoveryRequired: Bool
 
     init(fileManager: FileManager = .default) throws {
@@ -32,6 +64,7 @@ final class HistoryStoreClient {
             databasePath: root.appendingPathComponent("history.sqlite").path,
             payloadDirectory: payloads.path
         )
+        captureLimits = engine.captureLimits()
         startupRecoveryRequired = engine.startupRecoveryRequired()
     }
 
@@ -83,18 +116,43 @@ final class HistoryStoreClient {
         copiedAtMs: Int64,
         completion: @escaping Completion<PersistedCapture>
     ) {
+        // Checked before the queue hop: an oversized snapshot costs nothing more
+        // than the pasteboard read it has already paid for.
+        if let reason = captureLimits.rejection(for: representations) {
+            DispatchQueue.main.async { completion(.success(.rejected(reason: reason))) }
+            return
+        }
         queue.async { [engine] in
             let result = Result {
                 // ImageIO decode stays off AppKit's main thread. The original
                 // bytes are already present from pasteboard capture.
                 let imagePreview = ImagePreviewGenerator.makePreview(from: representations)
-                let stored = try engine.capture(
+                let outcome = try engine.capture(
                     representations: representations,
                     imagePreview: imagePreview,
                     copiedAtMs: copiedAtMs
                 )
-                let recentPage = try engine.recentPage(cursor: nil, direction: .older, limit: 50)
-                return PersistedCapture(result: stored, recentPage: recentPage)
+                switch outcome {
+                case let .stored(result):
+                    let recentPage = try engine.recentPage(
+                        cursor: nil, direction: .older, limit: 50
+                    )
+                    return PersistedCapture.stored(result: result, recentPage: recentPage)
+                case let .rejectedOversizedRepresentation(observedBytes, limitBytes):
+                    return PersistedCapture.rejected(
+                        reason: .oversizedRepresentation(
+                            observedBytes: observedBytes,
+                            limitBytes: limitBytes
+                        )
+                    )
+                case let .rejectedOversizedClip(observedBytes, limitBytes):
+                    return PersistedCapture.rejected(
+                        reason: .oversizedClip(
+                            observedBytes: observedBytes,
+                            limitBytes: limitBytes
+                        )
+                    )
+                }
             }
             DispatchQueue.main.async { completion(result) }
         }
