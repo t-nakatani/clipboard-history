@@ -13,7 +13,8 @@
 - メニューバーからの1クリックで開く半透明のAppKit履歴panel
 - Pasteboard type一覧をpayload読取前に検査する二段階capture
 - BLAKE3によるclip identityと`recopy = touch`
-- SQLite + FTS5 trigramによる、大文字小文字を区別しない部分一致検索
+- SQLite + FTS5 trigramによる、大文字小文字を区別しない部分一致検索。検索モードの選択はなく、prefixとsubstringの判断は`QueryPlanner`がneedle長から行う
+- substring検索のLIKEに対するESCAPE句を、needleがワイルドカードを含むときだけ出す。trigram索引が実際に効く
 - 100,000件のtransactional retentionと16KiB超payloadのcontent-addressed file保存
 - tombstone queueによる遅延GCと孤児payload回収
 - 50件単位の双方向keyset paging（保持summaryは最大200件）
