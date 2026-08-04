@@ -1,6 +1,6 @@
 # TODO
 
-最終更新: 2026-08-02
+最終更新: 2026-08-03
 
 このファイルは、Clipboard Historyを技術PoCから日常利用可能なmacOSアプリへ進めるための残タスクを管理します。
 
@@ -16,12 +16,61 @@
 
 ### ユーザーへ見えるエラー表示
 
-- [ ] panel内の固定領域を増やさないtoast/overlayを実装する
-- [ ] store初期化、capture、restore、delete、searchの失敗を表示する
-- [ ] concealed/transient拒否は必要な場合だけ静かに通知する
-- [ ] VoiceOver向けaccessibility announcementを追加する
+このアプリの価値は「コピーしたものは全部ここにある」という信頼です。守るべきは、保存されなかったのにされたと思い込んでいる状態を作らないこと。ユーザーはコピー元を閉じた後にそれを発見します。ここがP0である理由はその一点で、見た目の丁寧さではありません。
 
-完了条件: 主要操作が失敗した理由を、表示密度を損なわず確認できる。
+土台は実装済みです。panel下部に固定高1行のstatus rowがあり（`HistoryStatusView`）、状態は`HistoryStatus` enumで表して文言はview層に置いています。store初期化、capture、restore、delete、search、pagingの失敗はすでに`HistoryStatus.failed`へ流れ、`Priority.important`はpanelが閉じている間に発生しても保持されて後続のroutineな更新に埋もれません。
+
+方針: 失敗はpanelを開いた時に届けます。menu barアイコンでの常時通知や、他アプリへ割り込む通知は使いません。エラーの分類はRust、提示と文言はアプリレイヤーに閉じます。
+
+以下は独立して着手・完了できる3つの塊です。1項目を除いて順序の依存はありません（その1項目には依存を明記しています）。
+
+#### 開いた時に届く失敗通知
+
+`hasUnseenImportantStatus`と`markSeen()`が機構としては既にあるため、残りは挙動の決定と調整です。
+
+- [ ] panelを閉じている間に複数回失敗したとき、最新1件へ件数を添えて示す（現在は`show()`が上書きし、最後の1件しか残らない）
+- [ ] `markSeen()`が可視になった瞬間に既読とする挙動を見直す（履歴を探すために開いてfooterを読まずに閉じると消える）
+- [ ] 未読のimportantがある間はstatus rowを一時的に強調し、固定領域は増やさない
+- [ ] 強調の解除条件を決める（既読、次の操作、時間経過のいずれか）
+- [ ] 閉じている間の失敗が次に開いたときへ持ち越されることを、`SelfTest`の既存のclosed/openケースへ追加して回帰テストする
+- [ ] アプリ再起動を跨いだ持ち越しをどうするか決める。`hasUnseenImportantStatus`はプロセス内の状態なので、気づかれないまま再起動すると未読の失敗は消える。これはこの節の出発点である「保存されたと思い込んでいる状態」そのものなので、永続化するか、しないと決めて理由を書くかのどちらかにする
+
+完了条件: panelを閉じている間に起きた失敗が、同じ起動の中で次に開いたときへ必ず一度は届く。再起動を跨ぐ場合の扱いは上の項目で決める。
+
+#### エラー分類をFFI境界で保つ
+
+`StoreError::InvalidData`は「その1件だけ壊れている」ではありません。より新しいschemaで作られたDB（`schema.rs`の`schema is newer than this binary`）、DB全体の`quick_check`失敗、quarantine manifestの破損（`recovery.rs`）、retention設定やpage要求の引数誤り（`actor.rs`の`retention limits must be greater than zero`、`repository.rs`の`newer page requests require an anchor`）、1件のpayloadの整合性失敗（`payload.rs`）が、すべて同じvariantに同居しています。前半はstoreを開けていない失敗で、`AppDelegate`の`show(.failed(error))`から1件の削除失敗と同じstatus rowへ並びます。このvariantをまとめて「回復可能な単発の失敗」へ対応付けると、起動できていない相手に無意味な再試行を促すことになります。
+
+- [ ] `ClipboardFfiError`を`StoreError`のvariantへ対応させる（現在は`Store { message: String }`へ潰れている）
+- [ ] `InvalidData`を意味ごとに割り直す。Rust側のvariantを分けるか、operationとcontextを添えて分類するかを先に決める
+- [ ] 分類の粒度は、ユーザーへ促す行動の数で決める。少なくとも「以降すべて失敗する。再起動が要る」（`ActorStopped`）、「storeを開けていない」（schema不整合、quarantine manifest破損）、「その1件だけ失敗した」（payload整合性、restore上限超過）を区別する
+- [ ] 分類ごとに、ユーザーへ促す次の行動を変える
+- [ ] Swift側はエラー文字列を判定しない。分類はRust、提示はアプリレイヤーという線引きを保つ
+- [ ] 対応付けのないvariantへ落ちたときのfallbackと、原文の残し方を決める
+
+ユーザーへ出さないと決めたもの:
+
+- 呼び出し側の引数誤り（`newer page requests require an anchor`、`retention limits must be greater than zero`など）は、こちらの不具合でユーザーに打つ手がありません。ユーザー向けの分類には出さず、`InvalidInput`側か診断ログへ寄せます
+
+完了条件: storeを開けていない失敗、再起動が要る失敗、その1件だけの失敗を、ユーザーが区別できる。
+
+#### 通知の信号対雑音比
+
+繰り返し出る通知は読まれなくなり、読まれない通知は他の項目の投資も無駄にします。何を出さないかを決める塊です。
+
+- [ ] concealed/transient拒否を必要な場合だけに絞る（現在は拒否のたびに「保存対象外」を出す）
+- [ ] 抑制ルールを決める（初回だけ、panelが開いているときだけ、など）
+- [ ] サイズ超過拒否（`rejectedOversized`、important扱いで実装済み）との出し分けを明文化する
+- [ ] password managerから連続でcopyしても通知が積み上がらないことをテストする
+- [ ] 画像preview取得の失敗を表示する（現在は`HistoryFeedModel.imagePreview`が`try?`で捨てており、thumbnailが出ない理由が伝わらない）
+- [ ] 同じ失敗が連続したときに同一通知を繰り返さない抑制を入れる（「エラー分類をFFI境界で保つ」の後。何を同じ失敗とみなすかに分類が要る。`Store { message: String }`のままだと文字列比較になり、そちらの「Swift側はエラー文字列を判定しない」と衝突する）
+
+出さないと決めたもの:
+
+- background maintenanceとclean shutdownの失敗は`NSLog`のままにします。ユーザーに打つ手がなく、データも失われず、shutdownの失敗は次回起動時のrecoveryが吸収するためです
+- P0の時点では`HistoryStatus.failed`のdetailに`error.localizedDescription`がそのまま出るため、Rust/UniFFI由来の英語が混じります。日本語の文言への対応付けはP2のAccessibilityと品質へ置いています
+
+完了条件: 通知の頻度が日常のcopyで邪魔にならず、出る通知には対応する行動がある（文言そのものの読みやすさはP2）。
 
 ### アプリ統合ベンチマーク
 
@@ -124,6 +173,10 @@
 - [ ] light/dark appearanceを検証する
 - [ ] AppKit UI testと実Pasteboard integration testを追加する
 - [ ] schema migrationを実DB fixtureで回帰テストする
+- [ ] status rowとエラー通知の更新時に`NSAccessibility.post(element:notification:.announcementRequested)`を発行する
+- [ ] `HistoryStatus.Priority`をannouncementのpriorityへ対応付け、routineな更新で読み上げを溢れさせない
+- [ ] `HistoryStatus.failed`のdetailを日本語の説明文へ対応付ける（現在は`error.localizedDescription`のまま、Rust/UniFFI由来の英語が出る）
+- [ ] 再試行できる失敗とできない失敗を文言で区別する
 
 ### CI
 
