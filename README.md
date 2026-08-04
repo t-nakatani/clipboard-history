@@ -103,7 +103,7 @@ Rustは意味のある境界だけを残した3クレート構成です。
 
 ```sh
 unzip ClipboardHistory-<tag>-macos-arm64-unsigned.zip
-xattr -d com.apple.quarantine ClipboardHistory.app
+xattr -dr com.apple.quarantine ClipboardHistory.app
 mv ClipboardHistory.app /Applications/
 open /Applications/ClipboardHistory.app
 ```

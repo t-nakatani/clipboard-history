@@ -23,17 +23,14 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 40
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-          fetch-depth: 0
-
       - name: Resolve release metadata
         id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -eu
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="${INPUT_TAG:-$REF_NAME}"
           case "$tag" in
             v*) ;;
             *) echo "::error::タグは v で始まる必要があります: $tag"; exit 1 ;;
@@ -54,18 +51,55 @@ jobs:
             echo "asset=ClipboardHistory-$tag-macos-arm64-unsigned.zip"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Verify version metadata matches tag
+      - name: Resolve tag to a commit
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.meta.outputs.tag }}
         run: |
           set -eu
-          core="${{ steps.meta.outputs.core }}"
+          # workflow_dispatchの入力は非修飾のままだとbranchやSHAとしても解決される。
+          # tag namespaceだけを見て、buildより前に実体のcommitを確定させる。
+          if ! gh api "repos/$REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::タグが存在しません: $TAG"
+            exit 1
+          fi
+          sha=$(gh api "repos/$REPO/commits/tags/$TAG" --jq '.sha')
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "$TAG -> $sha"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ steps.meta.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify checkout matches the tag
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          EXPECTED_SHA: ${{ steps.tag.outputs.sha }}
+        run: |
+          set -eu
+          actual=$(git rev-parse HEAD)
+          if [ "$actual" != "$EXPECTED_SHA" ]; then
+            echo "::error::checkoutしたcommit ($actual) がタグ $TAG のcommit ($EXPECTED_SHA) と一致しません"
+            exit 1
+          fi
+
+      - name: Verify version metadata matches tag
+        env:
+          CORE: ${{ steps.meta.outputs.core }}
+        run: |
+          set -eu
           plist_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' app/macos/Info.plist)
-          if [ "$plist_version" != "$core" ]; then
-            echo "::error::Info.plistのCFBundleShortVersionString ($plist_version) がタグ ($core) と一致しません"
+          if [ "$plist_version" != "$CORE" ]; then
+            echo "::error::Info.plistのCFBundleShortVersionString ($plist_version) がタグ ($CORE) と一致しません"
             exit 1
           fi
           cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
-          if [ "$cargo_version" != "$core" ]; then
-            echo "::error::Cargo.tomlのworkspace version ($cargo_version) がタグ ($core) と一致しません"
+          if [ "$cargo_version" != "$CORE" ]; then
+            echo "::error::Cargo.tomlのworkspace version ($cargo_version) がタグ ($CORE) と一致しません"
             exit 1
           fi
 
@@ -141,19 +175,26 @@ jobs:
 
       - name: Package unsigned app
         id: package
+        env:
+          ASSET: ${{ steps.meta.outputs.asset }}
         run: |
           set -eu
-          asset="${{ steps.meta.outputs.asset }}"
           ditto -c -k --sequesterRsrc --keepParent \
             app/macos/build/ClipboardHistory.app \
-            "app/macos/build/$asset"
-          checksum=$(shasum -a 256 "app/macos/build/$asset" | awk '{print $1}')
+            "app/macos/build/$ASSET"
+          checksum=$(shasum -a 256 "app/macos/build/$ASSET" | awk '{print $1}')
           echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
 
       - name: Compose release notes
+        env:
+          ASSET: ${{ steps.meta.outputs.asset }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.meta.outputs.tag }}
         run: |
           set -eu
-          cat > release-notes.md <<'NOTES'
+          # 式の結果をrun:へ直接展開せず、placeholderを後から埋める
+          cat > release-notes.template.md <<'NOTES'
           > [!WARNING]
           > このビルドは**署名もnotarizationもされていません**。Apple Silicon (arm64) 専用です。
           > 内容を確認できない場合はインストールしないでください。
@@ -161,8 +202,8 @@ jobs:
           ## インストール
 
           ```sh
-          unzip ${{ steps.meta.outputs.asset }}
-          xattr -d com.apple.quarantine ClipboardHistory.app
+          unzip @ASSET@
+          xattr -dr com.apple.quarantine ClipboardHistory.app
           mv ClipboardHistory.app /Applications/
           open /Applications/ClipboardHistory.app
           ```
@@ -178,22 +219,38 @@ jobs:
           ## SHA-256
 
           ```text
-          ${{ steps.package.outputs.checksum }}  ${{ steps.meta.outputs.asset }}
+          @CHECKSUM@  @ASSET@
           ```
 
           ## 変更点と既知の問題
 
-          [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ steps.meta.outputs.tag }}/CHANGELOG.md)を参照してください。
+          [CHANGELOG.md](https://github.com/@REPO@/blob/@TAG@/CHANGELOG.md)を参照してください。
           NOTES
+          sed -e "s|@ASSET@|$ASSET|g" \
+              -e "s|@CHECKSUM@|$CHECKSUM|g" \
+              -e "s|@REPO@|$REPO|g" \
+              -e "s|@TAG@|$TAG|g" \
+              release-notes.template.md > release-notes.md
+          rm release-notes.template.md
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
         run: |
           set -eu
-          gh release create "${{ steps.meta.outputs.tag }}" \
-            "app/macos/build/${{ steps.meta.outputs.asset }}" \
-            --title "${{ steps.meta.outputs.tag }}" \
+          if [ "$PRERELEASE" = "true" ]; then
+            prerelease_flag=--prerelease
+          else
+            prerelease_flag=
+          fi
+          # --verify-tag: タグが無いときにdefault branchから作らせない
+          gh release create "$TAG" \
+            "app/macos/build/$ASSET" \
+            --title "$TAG" \
             --notes-file release-notes.md \
             --generate-notes \
-            ${{ steps.meta.outputs.prerelease == 'true' && '--prerelease' || '' }}
+            --verify-tag \
+            ${prerelease_flag:+"$prerelease_flag"}

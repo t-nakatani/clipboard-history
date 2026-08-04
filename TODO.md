@@ -119,7 +119,7 @@
 - [ ] 更新方式を決める（現在は手動での再ダウンロード）
 - [ ] universal binaryにするかarm64限定を維持するか決める
 
-現状: `v*`タグからApple Silicon向けunsigned buildを公開できます。署名がないため利用者は`xattr -d com.apple.quarantine`を必要とします。これはalphaの受け入れ範囲で、一般配布の前にcode signingとnotarizationを入れます。
+現状: `v*`タグからApple Silicon向けunsigned buildを公開できます。署名がないため利用者は`xattr -dr com.apple.quarantine`を必要とします。これはalphaの受け入れ範囲で、一般配布の前にcode signingとnotarizationを入れます。
 
 ### Accessibilityと品質
 
