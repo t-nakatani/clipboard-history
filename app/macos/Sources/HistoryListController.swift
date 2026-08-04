@@ -63,6 +63,7 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
             self.updateRows(reset: reset, apply: apply)
         }
         feed.shouldHoldNewestUpdate = { [weak self] in self?.shouldHoldNewestUpdate ?? false }
+        feed.clipDidLeaveStore = { [weak self] in self?.previewLoader.invalidate() }
     }
 
     deinit {
@@ -401,10 +402,10 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         cell.metadataLabel.stringValue = "\(summary.kind) · \(ByteCountFormatter.string(fromByteCount: Int64(summary.payloadSize), countStyle: .file))"
         cell.thumbnailImageView.image = Self.placeholderImage(for: summary.kind)
         if summary.hasImagePreview {
-            if let image = previewLoader.cachedImage(for: summary.id) {
+            if let image = previewLoader.cachedImage(for: summary) {
                 cell.thumbnailImageView.image = image
             } else {
-                previewLoader.load(id: summary.id)
+                previewLoader.load(summary)
             }
         }
         cell.toolTip = "\(summary.payloadSize) bytes · copied \(summary.copyCount)回"

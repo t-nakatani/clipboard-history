@@ -678,9 +678,167 @@ private func layoutStatusRow() -> Int32 {
     return 0
 }
 
+/// Covers the thumbnail cache against clip ids being handed out twice.
+func runPreviewCacheSelfTest() -> Int32 {
+    func imageBytes(side: Int) -> Data {
+        let representation = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: side,
+            pixelsHigh: side,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        )!
+        return representation.representation(using: .png, properties: [:])!
+    }
+
+    func summary(id: Int64, lastUsedAtMs: Int64) -> ClipSummaryDto {
+        ClipSummaryDto(
+            id: id,
+            kind: "image",
+            lastUsedAtMs: lastUsedAtMs,
+            pinned: false,
+            copyCount: 1,
+            payloadSize: 1,
+            preview: nil,
+            hasImagePreview: true
+        )
+    }
+
+    // Distinguished by side length, so the assertions can name which preview
+    // came back rather than only that something did.
+    var served = imageBytes(side: 4)
+    var fetches = 0
+    let loader = ImagePreviewLoader { _, completion in
+        fetches += 1
+        completion(RepresentationDto(uti: "public.png", bytes: served))
+    }
+
+    let deleted = summary(id: 7, lastUsedAtMs: 100)
+    loader.load(deleted)
+    guard let cached = loader.cachedImage(for: deleted), cached.size.width == 4 else {
+        fputs("a loaded preview was not cached for the row that asked for it\n", stderr)
+        return 1
+    }
+    guard fetches == 1 else {
+        fputs("expected exactly one fetch, saw \(fetches)\n", stderr)
+        return 1
+    }
+
+    // Deleting the newest clip returns its id to SQLite, which hands it to the
+    // next capture. That clip is a different picture under the same id.
+    served = imageBytes(side: 8)
+    let reused = summary(id: 7, lastUsedAtMs: 200)
+    if let stale = loader.cachedImage(for: reused) {
+        fputs(
+            "a reused clip id was served the deleted clip's preview (\(Int(stale.size.width))px)\n",
+            stderr
+        )
+        return 1
+    }
+    loader.load(reused)
+    guard let fresh = loader.cachedImage(for: reused), fresh.size.width == 8 else {
+        fputs("the clip that reused the id did not get its own preview\n", stderr)
+        return 1
+    }
+
+    // Rows that have not changed still read from the cache; scrolling must not
+    // turn into one fetch per redraw.
+    let before = fetches
+    _ = loader.cachedImage(for: reused)
+    _ = loader.cachedImage(for: reused)
+    guard fetches == before else {
+        fputs("an unchanged row refetched its preview\n", stderr)
+        return 1
+    }
+
+    // `last_used_at` is a wall-clock millisecond the store neither makes
+    // monotonic nor unique, so a capture that takes a deleted clip's id inside
+    // the same millisecond that clip last carried arrives on the identical
+    // identity. Verified against the real store: capturing at 100, deleting,
+    // then capturing at 100 again returns id 1 with last_used_at 100 both
+    // times. Releasing the previews when the clip leaves is what covers it.
+    served = imageBytes(side: 16)
+    let doomed = summary(id: 9, lastUsedAtMs: 300)
+    loader.load(doomed)
+    guard loader.cachedImage(for: doomed)?.size.width == 16 else {
+        fputs("the clip that is about to be deleted did not cache its preview\n", stderr)
+        return 1
+    }
+    loader.invalidate()
+    served = imageBytes(side: 32)
+    let tied = summary(id: 9, lastUsedAtMs: 300)
+    if let stale = loader.cachedImage(for: tied) {
+        fputs(
+            "an id reused within the same millisecond was served the deleted clip's preview "
+                + "(\(Int(stale.size.width))px)\n",
+            stderr
+        )
+        return 1
+    }
+    loader.load(tied)
+    guard loader.cachedImage(for: tied)?.size.width == 32 else {
+        fputs("the clip that reused id and timestamp did not get its own preview\n", stderr)
+        return 1
+    }
+
+    // A read that was already under way when the clip left must not repopulate
+    // the cache behind the release, and the row it was for has to stay free to
+    // ask again.
+    var pending: ((RepresentationDto?) -> Void)?
+    var racingFetches = 0
+    let racing = ImagePreviewLoader { _, completion in
+        racingFetches += 1
+        pending = completion
+    }
+    racing.load(doomed)
+    racing.invalidate()
+    pending?(RepresentationDto(uti: "public.png", bytes: imageBytes(side: 16)))
+    if let stale = racing.cachedImage(for: tied) {
+        fputs(
+            "an in-flight read cached the deleted clip's preview after the release "
+                + "(\(Int(stale.size.width))px)\n",
+            stderr
+        )
+        return 1
+    }
+    racing.load(tied)
+    guard racingFetches == 2 else {
+        fputs("a released request was still counted as in flight, saw \(racingFetches)\n", stderr)
+        return 1
+    }
+    pending?(RepresentationDto(uti: "public.png", bytes: imageBytes(side: 32)))
+    guard racing.cachedImage(for: tied)?.size.width == 32 else {
+        fputs("the row could not reload its preview after the release\n", stderr)
+        return 1
+    }
+
+    // The release is only reachable if the feed reports the removal, so the
+    // hook the panel wires `invalidate` to is part of the fix.
+    let store = StubHistoryStore(
+        recentPageResult: fixturePage(ids: [1]),
+        searchPageResult: fixturePage(ids: [1])
+    )
+    let feed = HistoryFeedModel(store: store, onStoreActivity: {})
+    var departures = 0
+    feed.clipDidLeaveStore = { departures += 1 }
+    feed.delete(id: 1)
+    guard departures == 1 else {
+        fputs("deleting a clip did not report that it left the store\n", stderr)
+        return 1
+    }
+
+    return 0
+}
+
 func runSelfTest() -> Int32 {
     let stages: [(String, () -> Int32)] = [
         ("bindings", runBindingSelfTest),
+        ("preview cache", runPreviewCacheSelfTest),
         ("history feed", runHistoryFeedSelfTest),
         ("status row", runStatusRowSelfTest),
     ]
