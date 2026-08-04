@@ -39,13 +39,20 @@
 
 #### エラー分類をFFI境界で保つ
 
+`StoreError::InvalidData`は「その1件だけ壊れている」ではありません。より新しいschemaで作られたDB（`schema.rs`の`schema is newer than this binary`）、DB全体の`quick_check`失敗、quarantine manifestの破損（`recovery.rs`）、retention設定やpage要求の引数誤り（`actor.rs`の`retention limits must be greater than zero`、`repository.rs`の`newer page requests require an anchor`）、1件のpayloadの整合性失敗（`payload.rs`）が、すべて同じvariantに同居しています。前半はstoreを開けていない失敗で、`AppDelegate`の`show(.failed(error))`から1件の削除失敗と同じstatus rowへ並びます。このvariantをまとめて「回復可能な単発の失敗」へ対応付けると、起動できていない相手に無意味な再試行を促すことになります。
+
 - [ ] `ClipboardFfiError`を`StoreError`のvariantへ対応させる（現在は`Store { message: String }`へ潰れている）
-- [ ] `ActorStopped`（以降すべて失敗する。再起動が要る）と`InvalidData`（その1件だけ壊れている）をSwiftが`switch`で区別できるようにする
+- [ ] `InvalidData`を意味ごとに割り直す。Rust側のvariantを分けるか、operationとcontextを添えて分類するかを先に決める
+- [ ] 分類の粒度は、ユーザーへ促す行動の数で決める。少なくとも「以降すべて失敗する。再起動が要る」（`ActorStopped`）、「storeを開けていない」（schema不整合、quarantine manifest破損）、「その1件だけ失敗した」（payload整合性、restore上限超過）を区別する
+- [ ] 分類ごとに、ユーザーへ促す次の行動を変える
 - [ ] Swift側はエラー文字列を判定しない。分類はRust、提示はアプリレイヤーという線引きを保つ
-- [ ] 回復不能な失敗と単発の失敗で、ユーザーへ促す次の行動を変える
 - [ ] 対応付けのないvariantへ落ちたときのfallbackと、原文の残し方を決める
 
-完了条件: 再起動が必要な失敗と、その1件だけの失敗を、ユーザーが区別できる。
+ユーザーへ出さないと決めたもの:
+
+- 呼び出し側の引数誤り（`newer page requests require an anchor`、`retention limits must be greater than zero`など）は、こちらの不具合でユーザーに打つ手がありません。ユーザー向けの分類には出さず、`InvalidInput`側か診断ログへ寄せます
+
+完了条件: storeを開けていない失敗、再起動が要る失敗、その1件だけの失敗を、ユーザーが区別できる。
 
 #### 通知の信号対雑音比
 
