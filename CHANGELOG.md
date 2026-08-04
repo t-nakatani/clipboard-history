@@ -21,7 +21,7 @@
 - Periodic/Idle/DeepIdleのbackground maintenance（WAL checkpoint、bounded incremental vacuum、条件付きFTS5 optimize）
 - unclean shutdown時だけ実行するbackground recoveryと破損storeの隔離・再構築
 - ホバーでの行選択、シングルクリックまたはReturnでの復元、検索欄が空のときのDelete/Backspaceでの削除
-- tag pushでunsigned appを公開するrelease workflow
+- tag pushでunsigned appを公開するrelease workflow。deployment targetは`Info.plist`の`LSMinimumSystemVersion`（macOS 13.0）だけを出所とし、成果物のminosとの一致を公開前に検証する
 
 ### Fixed
 

@@ -98,15 +98,46 @@ jobs:
         run: |
           set -eu
           app="app/macos/build/ClipboardHistory.app"
-          test -x "$app/Contents/MacOS/ClipboardHistory"
-          test -f "$app/Contents/Frameworks/libclipboard_ffi.dylib"
+          executable="$app/Contents/MacOS/ClipboardHistory"
+          dylib="$app/Contents/Frameworks/libclipboard_ffi.dylib"
+          test -x "$executable"
+          test -f "$dylib"
           # bundle内のdylibだけを参照し、build machine固有のパスを残さないこと
-          if otool -L "$app/Contents/MacOS/ClipboardHistory" | grep -q "$PWD/target"; then
+          if otool -L "$executable" | grep -q "$PWD/target"; then
             echo "::error::実行ファイルがbuild treeへの絶対パスを参照しています"
-            otool -L "$app/Contents/MacOS/ClipboardHistory"
+            otool -L "$executable"
             exit 1
           fi
-          lipo -archs "$app/Contents/MacOS/ClipboardHistory"
+          lipo -archs "$executable"
+          # deployment targetの宣言(LSMinimumSystemVersion)と実体(LC_BUILD_VERSION)が
+          # 食い違うと、宣言を信じた古いOSの利用者がdyldのエラーで起動できない。
+          # 同梱dylibもdyldが読むので同じ強さで見る。
+          normalize_version() {
+            printf '%s' "$1" | awk -F. '{
+              major = $1 + 0
+              minor = ($2 == "" ? 0 : $2 + 0)
+              patch = ($3 == "" ? 0 : $3 + 0)
+              if (patch > 0) { printf "%d.%d.%d", major, minor, patch }
+              else { printf "%d.%d", major, minor }
+            }'
+          }
+          declared_raw=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")
+          declared=$(normalize_version "$declared_raw")
+          for binary in "$executable" "$dylib"; do
+            actual_raw=$(vtool -show-build "$binary" | awk '$1 == "minos" { print $2; exit }')
+            if [ -z "$actual_raw" ]; then
+              echo "::error::$binary からLC_BUILD_VERSIONのminosを読めません"
+              vtool -show-build "$binary"
+              exit 1
+            fi
+            actual=$(normalize_version "$actual_raw")
+            if [ "$actual" != "$declared" ]; then
+              echo "::error::$binary のminos ($actual) がLSMinimumSystemVersion ($declared) と一致しません"
+              vtool -show-build "$binary"
+              exit 1
+            fi
+          done
+          echo "minos $declared / LSMinimumSystemVersion $declared_raw"
 
       - name: Package unsigned app
         id: package
