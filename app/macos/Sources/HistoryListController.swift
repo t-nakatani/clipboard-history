@@ -286,7 +286,9 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
         feed.delete(id: summary.id)
     }
 
-    private var selectedSummary: ClipSummaryDto? {
+    /// The row Return would restore and Delete would remove. Readable from
+    /// outside so the self-test can check where a delete leaves the reader.
+    var selectedSummary: ClipSummaryDto? {
         let row = tableView.selectedRow
         guard feed.rows.indices.contains(row) else { return nil }
         return feed.rows[row]
@@ -313,8 +315,13 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
 
     /// Keeps the reader's place across a row change: where the viewport sits and
     /// what is selected are read before the mutation and put back after it.
+    ///
+    /// `reloadData` drops the selection and, because the list never allows an
+    /// empty one, hands it back to row 0. So every outcome here has to be
+    /// stated: leaving the selection alone means jumping to the newest row.
     private func updateRows(reset: Bool, apply: () -> Void) {
         let anchor = reset ? nil : visibleAnchor()
+        let selectedRow = tableView.selectedRow
         let selectedId = selectedSummary?.id
 
         apply()
@@ -325,6 +332,15 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
                 tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             } else if reset {
                 tableView.deselectAll(nil)
+            } else if selectedId != nil, !feed.rows.isEmpty {
+                // The selected row itself is what went away — a delete. Holding
+                // its index gives the reader the row that moved up into it, and
+                // clamping covers deleting the last resident row, where nothing
+                // moved up and the row above is the neighbour instead.
+                tableView.selectRowIndexes(
+                    IndexSet(integer: min(selectedRow, feed.rows.count - 1)),
+                    byExtendingSelection: false
+                )
             }
             if let anchor {
                 restoreVisibleAnchor(anchor)

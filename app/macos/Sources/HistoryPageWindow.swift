@@ -53,6 +53,17 @@ struct HistoryPageWindow {
         newerContinuation = page.continuationCursor
     }
 
+    /// Drops a row that no longer exists, leaving the rest of the window where
+    /// it is.
+    ///
+    /// Paging state is deliberately untouched. Both anchors are derived from the
+    /// rows that remain, and removing one row from the middle changes neither
+    /// edge the window knows about, so what is resident stays resident and the
+    /// reader keeps their place.
+    mutating func remove(id: Int64) {
+        rows.removeAll { $0.id == id }
+    }
+
     mutating func markNewerAvailable() {
         if !rows.isEmpty {
             hasMoreNewer = true

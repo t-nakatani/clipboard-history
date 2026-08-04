@@ -243,12 +243,35 @@ final class HistoryFeedModel {
             switch result {
             case .success(true):
                 self.statusDidChange?(.deleted(preview: preview))
-                self.reload()
+                self.drop(id: id)
             case .success(false):
-                self.reload()
+                // The clip was already gone. The row is still on screen, so it
+                // leaves the same way it would have on a real delete.
+                self.drop(id: id)
             case let .failure(error):
                 self.statusDidChange?(.failed(error))
             }
+        }
+    }
+
+    /// Takes a deleted clip out of the resident rows in place.
+    ///
+    /// Re-running the query would be simpler, but deleting is something people
+    /// do repeatedly while reading down the history: a reload collapses the
+    /// window back to one page from the newest edge, so every delete costs the
+    /// reader their place and the rows they had already paged in.
+    ///
+    /// Emptying the window is the one case that still has to reload, because
+    /// there is then no row left to derive a paging anchor from.
+    private func drop(id: Int64) {
+        let mutate = { self.window.remove(id: id) }
+        if let updateRows {
+            updateRows(false, mutate)
+        } else {
+            mutate()
+        }
+        if window.rows.isEmpty {
+            reload()
         }
     }
 

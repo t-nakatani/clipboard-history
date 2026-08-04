@@ -678,10 +678,180 @@ private func layoutStatusRow() -> Int32 {
     return 0
 }
 
+/// Covers what deleting a row does to the rows around it.
+func runDeleteSelfTest() -> Int32 {
+    let store = StubHistoryStore(
+        recentPageResult: fixturePage(ids: [5, 4, 3, 2, 1], hasMore: true),
+        searchPageResult: fixturePage(ids: [])
+    )
+    let feed = HistoryFeedModel(store: store, onStoreActivity: {})
+    feed.reload()
+    guard feed.rows.map(\.id) == [5, 4, 3, 2, 1] else {
+        fputs("feed did not load the recent page\n", stderr)
+        return 1
+    }
+
+    // `reset` is what makes the list drop its scroll anchor, so it is the flag
+    // that decides whether a delete costs the reader their place.
+    var resets: [Bool] = []
+    feed.updateRows = { reset, apply in
+        resets.append(reset)
+        apply()
+    }
+
+    let loadsBeforeDelete = store.recentPageCalls
+    feed.delete(id: 3)
+
+    guard feed.rows.map(\.id) == [5, 4, 2, 1] else {
+        fputs("delete did not remove the row: \(feed.rows.map(\.id))\n", stderr)
+        return 1
+    }
+    guard resets == [false] else {
+        fputs("delete replaced the whole window instead of dropping one row\n", stderr)
+        return 1
+    }
+    guard store.recentPageCalls == loadsBeforeDelete else {
+        fputs("delete reloaded from the newest edge, throwing the reader back to the top\n", stderr)
+        return 1
+    }
+    guard feed.hasMoreOlder else {
+        fputs("delete discarded the window's older paging edge\n", stderr)
+        return 1
+    }
+
+    // Deleting the last resident row leaves nothing to derive an anchor from,
+    // which is the one case that still has to go back to the store.
+    store.recentPageResult = fixturePage(ids: [9])
+    for id: Int64 in [5, 4, 2, 1] {
+        feed.delete(id: id)
+    }
+    guard store.recentPageCalls > loadsBeforeDelete else {
+        fputs("emptying the window by deleting did not reload\n", stderr)
+        return 1
+    }
+    guard feed.rows.map(\.id) == [9] else {
+        fputs("the reload after an emptied window did not restock the rows\n", stderr)
+        return 1
+    }
+
+    return deleteKeepsNeighbouringRowSelected()
+}
+
+/// Drives a laid-out list the way the keyboard does, so where a delete leaves
+/// the selection is measured through the real path rather than assumed from the
+/// feed's rows.
+private final class DeleteSelectionHarness {
+    let feed: HistoryFeedModel
+    let controller: HistoryListController
+    private let textView = NSTextView()
+
+    init(ids: [Int64]) {
+        let configuration = HistoryPanelConfiguration.standard
+        // No older page: a laid-out scroll view posts bounds changes, and a
+        // paging edge would let those pull rows in behind the delete.
+        let store = StubHistoryStore(
+            recentPageResult: fixturePage(ids: ids),
+            searchPageResult: fixturePage(ids: [])
+        )
+        feed = HistoryFeedModel(store: store, onStoreActivity: {})
+        let frame = NSRect(
+            x: 0,
+            y: 0,
+            width: configuration.window.width,
+            height: configuration.window.minimumHeight
+        )
+        controller = HistoryListController(
+            configuration: configuration,
+            feed: feed,
+            previewLoader: ImagePreviewLoader(fetch: feed.imagePreview),
+            statusView: HistoryStatusView(configuration: configuration),
+            contentFrame: frame
+        )
+        controller.contentView.frame = frame
+        controller.contentView.layoutSubtreeIfNeeded()
+        feed.reload()
+        controller.contentView.layoutSubtreeIfNeeded()
+    }
+
+    /// Sends a key command the way the search field routes it to the list.
+    func send(_ selector: Selector) {
+        _ = controller.control(controller.searchField, textView: textView, doCommandBy: selector)
+    }
+
+    var selectedId: Int64? { controller.selectedSummary?.id }
+}
+
+/// Deleting is something people repeat while reading down the history, so the
+/// selection has to end up on a neighbour of the row that went away — both in
+/// the middle of the resident rows and at their end, where there is no row
+/// below to take the freed index.
+private func deleteKeepsNeighbouringRowSelected() -> Int32 {
+    // More rows than the viewport holds, so moving to the end really scrolls:
+    // that is the state the reader deletes from, and the one where the list
+    // keeps a scroll anchor across the change.
+    let ids: [Int64] = (1 ... 20).reversed().map(Int64.init)
+    let harness = DeleteSelectionHarness(ids: ids)
+    guard harness.feed.rows.map(\.id) == ids else {
+        fputs("the list did not load the recent page\n", stderr)
+        return 1
+    }
+
+    // Mid-list: the row below moves up into the freed index and is what the
+    // next Delete acts on.
+    harness.send(#selector(NSResponder.moveToBeginningOfDocument(_:)))
+    harness.send(#selector(NSResponder.moveDown(_:)))
+    harness.send(#selector(NSResponder.moveDown(_:)))
+    guard harness.selectedId == 18 else {
+        fputs("the list did not select the row the test meant to delete: \(String(describing: harness.selectedId))\n", stderr)
+        return 1
+    }
+    harness.send(#selector(NSResponder.deleteBackward(_:)))
+    guard !harness.feed.rows.contains(where: { $0.id == 18 }) else {
+        fputs("deleting mid-list did not remove the row\n", stderr)
+        return 1
+    }
+    guard harness.selectedId == 17 else {
+        fputs("deleting mid-list did not carry the selection to the row below: \(String(describing: harness.selectedId))\n", stderr)
+        return 1
+    }
+
+    // The last resident row has nothing below it, so the selection has to fall
+    // back to the row above instead of jumping to the newest clip, which sits
+    // off screen at the other end of the list.
+    harness.send(#selector(NSResponder.moveToEndOfDocument(_:)))
+    guard harness.selectedId == 1 else {
+        fputs("the list did not select the last row: \(String(describing: harness.selectedId))\n", stderr)
+        return 1
+    }
+    harness.send(#selector(NSResponder.deleteBackward(_:)))
+    guard !harness.feed.rows.contains(where: { $0.id == 1 }) else {
+        fputs("deleting the last row did not remove it\n", stderr)
+        return 1
+    }
+    guard harness.selectedId == 2 else {
+        fputs("deleting the last row put the selection on \(String(describing: harness.selectedId)) instead of the row above it\n", stderr)
+        return 1
+    }
+
+    // Held down at the end of the list, Delete has to keep walking upwards
+    // through the neighbouring rows rather than start eating the newest ones.
+    harness.send(#selector(NSResponder.deleteBackward(_:)))
+    let deleted: Set<Int64> = [18, 1, 2]
+    guard harness.feed.rows.map(\.id) == ids.filter({ !deleted.contains($0) }),
+          harness.selectedId == 3
+    else {
+        fputs("repeating Delete at the end of the list did not walk to the next neighbour: \(harness.feed.rows.map(\.id)) selecting \(String(describing: harness.selectedId))\n", stderr)
+        return 1
+    }
+
+    return 0
+}
+
 func runSelfTest() -> Int32 {
     let stages: [(String, () -> Int32)] = [
         ("bindings", runBindingSelfTest),
         ("history feed", runHistoryFeedSelfTest),
+        ("delete", runDeleteSelfTest),
         ("status row", runStatusRowSelfTest),
     ]
     for (name, stage) in stages {
