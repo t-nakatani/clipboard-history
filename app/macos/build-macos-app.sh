@@ -26,6 +26,19 @@ if [ "$developer_dir" = "/Library/Developer/CommandLineTools" ] && \
     swift_core_stub="$link_sdk/usr/lib/swift/libswiftCore.tbd"
 fi
 
+# deployment targetの出所をInfo.plistのLSMinimumSystemVersionだけにする。
+# swiftcへ-targetを渡さないとdeployment targetがbuild machineのOSになり、
+# Info.plistの宣言と実体が食い違う。cargo側はMACOSX_DEPLOYMENT_TARGETで決まるので、
+# 同じ値を両方へ与え、食い違いが構造的に起きない形にする。
+min_os=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$script_dir/Info.plist")
+if [ -z "$min_os" ]; then
+    echo "Info.plistからLSMinimumSystemVersionを読めませんでした" >&2
+    exit 1
+fi
+# archはnative build。arm64限定であることはrelease workflowのbundle検査で見る。
+swift_target="$(/usr/bin/uname -m)-apple-macos$min_os"
+export MACOSX_DEPLOYMENT_TARGET="$min_os"
+
 cd "$project_dir"
 cargo build --release -p clipboard-ffi
 cargo build -p clipboard-ffi --features bindgen-cli --bin clipboard-uniffi-bindgen
@@ -63,6 +76,7 @@ rust_dylib_id=$(/usr/bin/otool -D "$project_dir/target/release/libclipboard_ffi.
     "$script_dir/Sources/PasteboardMonitor.swift" \
     "$script_dir/Sources/PasteboardWriter.swift" \
     "$generated_dir/clipboard_ffi.swift" \
+    -target "$swift_target" \
     -sdk "$compile_sdk" \
     -module-cache-path "$module_cache_dir" \
     -I "$generated_dir" \
