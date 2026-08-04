@@ -1,6 +1,6 @@
 # TODO
 
-最終更新: 2026-08-02
+最終更新: 2026-08-04
 
 このファイルは、Clipboard Historyを技術PoCから日常利用可能なmacOSアプリへ進めるための残タスクを管理します。
 
@@ -45,6 +45,10 @@
 - [ ] maintenanceがcapture/searchのp95を悪化させないことを測る
 
 実装: Rust store actorが`Periodic`・`Idle`・`DeepIdle`を閾値判定し、GC、WAL checkpoint、bounded incremental vacuum、削除量に応じたFTS5 optimizeを実行する。macOS側はcapture/searchの活動を基準に45秒周期でbackground maintenanceを投入する。
+
+### 前方一致索引の棚卸し
+
+- [ ] `idx_clips_text_prefix`は#31で検索モード選択が消えて以降、productionのどのクエリからも使われないまま全insert/`normalized_text` updateの書き込みコストを払い続けている。#37で前方一致を併用するかを決め、見送るなら索引と`search_prefix_page`をまとめて削除する
 
 ### retentionとpin
 

@@ -202,10 +202,18 @@ func runBindingSelfTest() -> Int32 {
             fputs("Swift could not restore representations through ClipboardEngine\n", stderr)
             return 1
         }
-        guard try engine!.search(query: "hell", mode: .prefix, limit: 50).count == 1,
-              try engine!.search(query: "ell", mode: .substring, limit: 50).count == 1,
-              try engine!.search(query: "hello", mode: .exact, limit: 50).count == 1 else {
-            fputs("Swift search modes did not preserve exact semantics\n", stderr)
+        // "hell" leads the stored "hello" and "ell" sits inside it. Both have to
+        // find the one clip now that substring is the only match mode: an
+        // interior needle coming back empty means the search stopped matching
+        // substrings, not that the FFI call failed.
+        let leadingHits = try engine!.search(query: "hell", limit: 50).count
+        let interiorHits = try engine!.search(query: "ell", limit: 50).count
+        guard leadingHits == 1, interiorHits == 1 else {
+            fputs(
+                "Swift search did not substring-match the stored \"hello\" clip: "
+                    + "\"hell\" returned \(leadingHits), \"ell\" returned \(interiorHits), expected 1 each\n",
+                stderr
+            )
             return 1
         }
         guard
@@ -305,7 +313,6 @@ private final class StubHistoryStore: HistoryStore {
 
     func searchPage(
         query: String,
-        mode: SearchModeDto,
         cursor: HistoryCursorDto?,
         direction: PageDirectionDto,
         limit: UInt32,
@@ -469,7 +476,7 @@ func runHistoryFeedSelfTest() -> Int32 {
 
     // While a search is live, a capture re-runs the search instead of jumping
     // back to the recent feed.
-    feed.search(text: "item", mode: .substring)
+    feed.search(text: "item")
     guard feed.rows.map(\.id) == [2] else {
         fputs("search did not replace the rows with its results\n", stderr)
         return 1
@@ -489,7 +496,7 @@ func runHistoryFeedSelfTest() -> Int32 {
 
     // Paging stays inside the live query and asks in the requested direction.
     store.searchPageResult = fixturePage(ids: [1], hasMore: true)
-    feed.search(text: "item", mode: .substring)
+    feed.search(text: "item")
     let searchCallsBeforePaging = store.searchPageCalls
     feed.loadPage(.older)
     guard
@@ -539,7 +546,7 @@ func runHistoryFeedSelfTest() -> Int32 {
         searchPageResult: fixturePage(ids: [2])
     )
     let pendingFeed = HistoryFeedModel(onStoreActivity: {})
-    pendingFeed.search(text: "item", mode: .substring)
+    pendingFeed.search(text: "item")
     pendingFeed.attach(store: pendingSearchStore)
     pendingFeed.reload()
     guard

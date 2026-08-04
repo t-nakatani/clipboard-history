@@ -1,7 +1,7 @@
 use crate::{
     CaptureLimits, CaptureOutcome, CaptureRejection, ClipCandidate, ClipKind, ClipboardSnapshot,
-    HistoryRepository, MatchMode, QueryPlanner, Representation, SearchTextPolicy,
-    canonical_clip_identity, normalize_search_text,
+    HistoryRepository, QueryPlanner, Representation, SearchTextPolicy, canonical_clip_identity,
+    normalize_search_text,
 };
 
 pub struct HistoryService<R> {
@@ -76,26 +76,19 @@ impl<R: HistoryRepository> HistoryService<R> {
         self.repository.image_preview(id)
     }
 
-    pub fn search(
-        &self,
-        query: &str,
-        mode: MatchMode,
-        limit: usize,
-    ) -> Result<Vec<crate::ClipSummary>, R::Error> {
-        self.repository
-            .search(QueryPlanner.plan(query, mode), limit)
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<crate::ClipSummary>, R::Error> {
+        self.repository.search(QueryPlanner.plan(query), limit)
     }
 
     pub fn search_page(
         &self,
         query: &str,
-        mode: MatchMode,
         cursor: Option<crate::HistoryCursor>,
         direction: crate::PageDirection,
         limit: usize,
     ) -> Result<crate::HistoryPage, R::Error> {
         self.repository
-            .search_page(QueryPlanner.plan(query, mode), cursor, direction, limit)
+            .search_page(QueryPlanner.plan(query), cursor, direction, limit)
     }
 }
 

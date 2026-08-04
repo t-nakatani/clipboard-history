@@ -1048,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn actor_searches_exact_prefix_and_literal_substring_without_fuzzy_matching() {
+    fn actor_searches_prefix_and_literal_substring_without_fuzzy_matching() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1084,29 +1084,15 @@ mod tests {
                 .unwrap();
         }
 
-        let exact = service
-            .search("alpha", clipboard_core::MatchMode::Exact, 50)
-            .unwrap();
-        assert_eq!(exact.len(), 1);
-        assert_eq!(exact[0].preview.as_deref(), Some("alpha"));
+        assert_eq!(prefix_search(&service, "alpha").len(), 2);
+        assert_eq!(service.search("alpha", 50).unwrap().len(), 3);
 
-        let prefix = service
-            .search("alpha", clipboard_core::MatchMode::Prefix, 50)
-            .unwrap();
-        assert_eq!(prefix.len(), 2);
-        let substring = service
-            .search("alpha", clipboard_core::MatchMode::Substring, 50)
-            .unwrap();
-        assert_eq!(substring.len(), 3);
-
-        let literal_percent = service
-            .search("100%", clipboard_core::MatchMode::Substring, 50)
-            .unwrap();
+        // Wildcards stay literal. These needles are the ones that still carry an
+        // ESCAPE clause, so they also cover the escaped branch of LikePattern.
+        let literal_percent = service.search("100%", 50).unwrap();
         assert_eq!(literal_percent.len(), 1);
         assert_eq!(literal_percent[0].preview.as_deref(), Some("100% real"));
-        let literal_underscore = service
-            .search("a_b", clipboard_core::MatchMode::Exact, 50)
-            .unwrap();
+        let literal_underscore = service.search("a_b", 50).unwrap();
         assert_eq!(literal_underscore.len(), 1);
         assert_eq!(literal_underscore[0].preview.as_deref(), Some("a_b"));
 
@@ -1115,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn search_ignores_case_in_every_match_mode() {
+    fn search_ignores_case_in_prefix_and_substring() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1154,33 +1140,14 @@ mod tests {
                 .unwrap();
         }
 
-        let exact = service
-            .search("alpha", clipboard_core::MatchMode::Exact, 50)
-            .unwrap();
-        assert_eq!(exact.len(), 1);
-        assert_eq!(exact[0].preview.as_deref(), Some("Alpha"));
-
-        let prefix = service
-            .search("aLPha", clipboard_core::MatchMode::Prefix, 50)
-            .unwrap();
-        assert_eq!(prefix.len(), 2);
-
-        let substring = service
-            .search("ALPHA", clipboard_core::MatchMode::Substring, 50)
-            .unwrap();
-        assert_eq!(substring.len(), 3);
+        assert_eq!(prefix_search(&service, "aLPha").len(), 2);
+        assert_eq!(service.search("ALPHA", 50).unwrap().len(), 3);
 
         // Needles shorter than three characters are planned as a bounded recent
         // scan rather than an index lookup.
-        let short_scan = service
-            .search("AL", clipboard_core::MatchMode::Substring, 50)
-            .unwrap();
-        assert_eq!(short_scan.len(), 3);
+        assert_eq!(service.search("AL", 50).unwrap().len(), 3);
 
-        let long_prefix = service
-            .search(&long.to_uppercase(), clipboard_core::MatchMode::Prefix, 50)
-            .unwrap();
-        assert_eq!(long_prefix.len(), 1);
+        assert_eq!(prefix_search(&service, &long.to_uppercase()).len(), 1);
 
         drop(service);
         std::fs::remove_dir_all(root).unwrap();
@@ -1349,13 +1316,7 @@ mod tests {
         let mut results = Vec::new();
         loop {
             let page = service
-                .search_page(
-                    "alpha-",
-                    clipboard_core::MatchMode::Prefix,
-                    cursor,
-                    PageDirection::Older,
-                    3,
-                )
+                .search_page("alpha-", cursor, PageDirection::Older, 3)
                 .unwrap();
             let next_cursor = page.continuation_cursor;
             results.extend(page.items);
@@ -1425,13 +1386,7 @@ mod tests {
         let mut saw_empty_truncated_page = false;
         loop {
             let page = service
-                .search_page(
-                    "x",
-                    clipboard_core::MatchMode::Substring,
-                    cursor,
-                    PageDirection::Older,
-                    50,
-                )
+                .search_page("x", cursor, PageDirection::Older, 50)
                 .unwrap();
             if page.items.is_empty() && page.truncated {
                 saw_empty_truncated_page = true;
@@ -1806,5 +1761,27 @@ mod tests {
             last_used_at_ms: item.last_used_at_ms,
             id: item.id,
         }
+    }
+
+    /// Runs a prefix match against the repository directly.
+    ///
+    /// `HistoryService` always plans a substring search, so prefix matching is
+    /// only reachable through the port. That is where it belongs: the mode is
+    /// part of the repository's contract, and `search_prefix_page` plus
+    /// `idx_clips_text_prefix` have to keep working for short needles.
+    fn prefix_search(
+        service: &HistoryService<StoreHandle>,
+        needle: &str,
+    ) -> Vec<clipboard_core::ClipSummary> {
+        service
+            .repository()
+            .search(
+                PlannedQuery::Indexed {
+                    mode: clipboard_core::MatchMode::Prefix,
+                    needle: needle.to_owned(),
+                },
+                50,
+            )
+            .unwrap()
     }
 }
