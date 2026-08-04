@@ -40,6 +40,11 @@ final class HistoryFeedModel {
     /// `apply` performs the mutation. Unset, the mutation simply runs.
     var updateRows: ((_ reset: Bool, _ apply: () -> Void) -> Void)?
     var statusDidChange: ((HistoryStatus) -> Void)?
+    /// Fires once the store confirms a clip is gone. The id it leaves behind
+    /// goes to the next capture, and that capture can arrive carrying the same
+    /// `lastUsedAtMs` the removed row had, so anything holding the removed
+    /// clip's bytes has to let go of them here.
+    var clipDidLeaveStore: (() -> Void)?
 
     var rows: [ClipSummaryDto] { window.rows }
     var hasMoreNewer: Bool { window.hasMoreNewer }
@@ -242,9 +247,13 @@ final class HistoryFeedModel {
             guard let self else { return }
             switch result {
             case .success(true):
+                self.clipDidLeaveStore?()
                 self.statusDidChange?(.deleted(preview: preview))
                 self.reload()
             case .success(false):
+                // The row was already gone. Whatever removed it could have
+                // freed its id too, so the same release has to happen.
+                self.clipDidLeaveStore?()
                 self.reload()
             case let .failure(error):
                 self.statusDidChange?(.failed(error))

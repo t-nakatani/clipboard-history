@@ -63,6 +63,7 @@ final class HistoryListController: NSObject, NSTableViewDataSource, NSTableViewD
             self.updateRows(reset: reset, apply: apply)
         }
         feed.shouldHoldNewestUpdate = { [weak self] in self?.shouldHoldNewestUpdate ?? false }
+        feed.clipDidLeaveStore = { [weak self] in self?.previewLoader.invalidate() }
     }
 
     deinit {

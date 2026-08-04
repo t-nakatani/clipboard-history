@@ -756,6 +756,82 @@ func runPreviewCacheSelfTest() -> Int32 {
         return 1
     }
 
+    // `last_used_at` is a wall-clock millisecond the store neither makes
+    // monotonic nor unique, so a capture that takes a deleted clip's id inside
+    // the same millisecond that clip last carried arrives on the identical
+    // identity. Verified against the real store: capturing at 100, deleting,
+    // then capturing at 100 again returns id 1 with last_used_at 100 both
+    // times. Releasing the previews when the clip leaves is what covers it.
+    served = imageBytes(side: 16)
+    let doomed = summary(id: 9, lastUsedAtMs: 300)
+    loader.load(doomed)
+    guard loader.cachedImage(for: doomed)?.size.width == 16 else {
+        fputs("the clip that is about to be deleted did not cache its preview\n", stderr)
+        return 1
+    }
+    loader.invalidate()
+    served = imageBytes(side: 32)
+    let tied = summary(id: 9, lastUsedAtMs: 300)
+    if let stale = loader.cachedImage(for: tied) {
+        fputs(
+            "an id reused within the same millisecond was served the deleted clip's preview "
+                + "(\(Int(stale.size.width))px)\n",
+            stderr
+        )
+        return 1
+    }
+    loader.load(tied)
+    guard loader.cachedImage(for: tied)?.size.width == 32 else {
+        fputs("the clip that reused id and timestamp did not get its own preview\n", stderr)
+        return 1
+    }
+
+    // A read that was already under way when the clip left must not repopulate
+    // the cache behind the release, and the row it was for has to stay free to
+    // ask again.
+    var pending: ((RepresentationDto?) -> Void)?
+    var racingFetches = 0
+    let racing = ImagePreviewLoader { _, completion in
+        racingFetches += 1
+        pending = completion
+    }
+    racing.load(doomed)
+    racing.invalidate()
+    pending?(RepresentationDto(uti: "public.png", bytes: imageBytes(side: 16)))
+    if let stale = racing.cachedImage(for: tied) {
+        fputs(
+            "an in-flight read cached the deleted clip's preview after the release "
+                + "(\(Int(stale.size.width))px)\n",
+            stderr
+        )
+        return 1
+    }
+    racing.load(tied)
+    guard racingFetches == 2 else {
+        fputs("a released request was still counted as in flight, saw \(racingFetches)\n", stderr)
+        return 1
+    }
+    pending?(RepresentationDto(uti: "public.png", bytes: imageBytes(side: 32)))
+    guard racing.cachedImage(for: tied)?.size.width == 32 else {
+        fputs("the row could not reload its preview after the release\n", stderr)
+        return 1
+    }
+
+    // The release is only reachable if the feed reports the removal, so the
+    // hook the panel wires `invalidate` to is part of the fix.
+    let store = StubHistoryStore(
+        recentPageResult: fixturePage(ids: [1]),
+        searchPageResult: fixturePage(ids: [1])
+    )
+    let feed = HistoryFeedModel(store: store, onStoreActivity: {})
+    var departures = 0
+    feed.clipDidLeaveStore = { departures += 1 }
+    feed.delete(id: 1)
+    guard departures == 1 else {
+        fputs("deleting a clip did not report that it left the store\n", stderr)
+        return 1
+    }
+
     return 0
 }
 
