@@ -202,9 +202,18 @@ func runBindingSelfTest() -> Int32 {
             fputs("Swift could not restore representations through ClipboardEngine\n", stderr)
             return 1
         }
-        guard try engine!.search(query: "hell", limit: 50).count == 1,
-              try engine!.search(query: "ell", limit: 50).count == 1 else {
-            fputs("Swift search did not survive the FFI boundary\n", stderr)
+        // "hell" leads the stored "hello" and "ell" sits inside it. Both have to
+        // find the one clip now that substring is the only match mode: an
+        // interior needle coming back empty means the search stopped matching
+        // substrings, not that the FFI call failed.
+        let leadingHits = try engine!.search(query: "hell", limit: 50).count
+        let interiorHits = try engine!.search(query: "ell", limit: 50).count
+        guard leadingHits == 1, interiorHits == 1 else {
+            fputs(
+                "Swift search did not substring-match the stored \"hello\" clip: "
+                    + "\"hell\" returned \(leadingHits), \"ell\" returned \(interiorHits), expected 1 each\n",
+                stderr
+            )
             return 1
         }
         guard

@@ -191,21 +191,9 @@ pub(crate) fn recent_page(
     let limit = limit.clamp(1, 200);
     let fetch_limit = (limit + 1) as i64;
     let page = PageSql::new(cursor, direction)?;
-    let sql = format!(
-        "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
-                c.payload_size, substr(c.normalized_text, 1, 256),
-                EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
-         FROM clips AS c
-         WHERE {}
-         ORDER BY c.last_used_at {}, c.id {}
-         LIMIT :limit",
-        page.predicate("c"),
-        page.order,
-        page.order
-    );
     let items = query_summaries(
         connection,
-        &sql,
+        &recent_page_sql(page),
         named_params! {
             ":anchor_time": page.anchor.last_used_at_ms,
             ":anchor_id": page.anchor.id.0,
@@ -306,29 +294,9 @@ pub(crate) fn search_page(
         PlannedQuery::Empty => recent_page(connection, cursor, direction, limit),
         PlannedQuery::RecentScan { mode, needle } => {
             let pattern = LikePattern::new(mode, &needle);
-            let sql = format!(
-                "SELECT id, content_kind, last_used_at, pinned, copy_count,
-                        payload_size, substr(normalized_text, 1, 256), has_image_preview
-                 FROM (
-                     SELECT id, content_kind, last_used_at, pinned, copy_count,
-                            payload_size, normalized_text,
-                            EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = clips.id)
-                                AS has_image_preview
-                     FROM clips
-                     WHERE normalized_text IS NOT NULL AND {predicate}
-                     ORDER BY last_used_at {order}, id {order}
-                     LIMIT 2000
-                 )
-                 WHERE normalized_text LIKE :pattern{escape}
-                 ORDER BY last_used_at {order}, id {order}
-                 LIMIT :limit",
-                predicate = page.predicate("clips"),
-                order = page.order,
-                escape = pattern.escape,
-            );
             let items = query_summaries(
                 connection,
-                &sql,
+                &recent_scan_sql(page, &pattern),
                 named_params! {
                     ":pattern": pattern.value,
                     ":anchor_time": page.anchor.last_used_at_ms,
@@ -359,23 +327,9 @@ pub(crate) fn search_page(
         } => search_prefix_page(connection, &needle, page, limit),
         PlannedQuery::Indexed { mode, needle } => {
             let pattern = LikePattern::new(mode, &needle);
-            let sql = format!(
-                "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
-                        c.payload_size, substr(c.normalized_text, 1, 256),
-                        EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
-                 FROM clips_fts
-                 JOIN clips AS c ON c.id = clips_fts.rowid
-                 WHERE clips_fts.normalized_text LIKE :pattern{escape}
-                   AND {predicate}
-                 ORDER BY c.last_used_at {order}, c.id {order}
-                 LIMIT :limit",
-                predicate = page.predicate("c"),
-                order = page.order,
-                escape = pattern.escape,
-            );
             let items = query_summaries(
                 connection,
-                &sql,
+                &indexed_substring_sql(page, &pattern),
                 named_params! {
                     ":pattern": pattern.value,
                     ":anchor_time": page.anchor.last_used_at_ms,
@@ -388,6 +342,19 @@ pub(crate) fn search_page(
     }
 }
 
+/// Seeks `idx_clips_text_prefix` for a leading match.
+///
+/// Nothing in production reaches this today: `QueryPlanner::plan` only ever
+/// emits `MatchMode::Substring`, so the arm above is dead until #37 brings
+/// prefix matching back as a complement to substring search for short needles.
+/// It stays because that issue is the one that decides how it is reached, and
+/// because the store port is where the contract belongs.
+///
+/// The cost of keeping it is not zero: `idx_clips_text_prefix` is answered by
+/// no production query at all right now, yet every insert and every
+/// `normalized_text` update still pays to maintain it. If #37 is dropped or
+/// deferred indefinitely, the index and this function should go together --
+/// see the note in TODO.md.
 fn search_prefix_page(
     connection: &Connection,
     needle: &str,
@@ -396,44 +363,10 @@ fn search_prefix_page(
 ) -> Result<HistoryPage, StoreError> {
     let pattern = LikePattern::new(MatchMode::Prefix, needle);
     let fetch_limit = (limit + 1) as i64;
-    // rusqlite requires every named parameter to exist in both SQL variants.
-    // The NULL guard keeps `:key` present when the expression index uses LIKE.
-    // LIKE ignores collation entirely, so NOCASE is not what makes the match
-    // case-insensitive here; the case_sensitive_like pragma is. It is what lets
-    // both variants seek idx_clips_text_prefix, which is collated the same way.
-    // The equality variant does need it for correctness as well.
-    let (prefix_clause, key) = if needle.chars().count() <= 64 {
-        (
-            format!(
-                ":key IS NULL
-                 AND substr(c.normalized_text, 1, 64) COLLATE NOCASE LIKE :pattern{escape}",
-                escape = pattern.escape,
-            ),
-            None,
-        )
-    } else {
-        (
-            "substr(c.normalized_text, 1, 64) COLLATE NOCASE = :key".to_owned(),
-            Some(needle.chars().take(64).collect::<String>()),
-        )
-    };
-    let sql = format!(
-        "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
-                c.payload_size, substr(c.normalized_text, 1, 256),
-                EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
-         FROM clips AS c
-         WHERE {prefix_clause}
-           AND c.normalized_text LIKE :pattern{escape}
-           AND {predicate}
-         ORDER BY c.last_used_at {order}, c.id {order}
-         LIMIT :limit",
-        predicate = page.predicate("c"),
-        order = page.order,
-        escape = pattern.escape,
-    );
+    let key = prefix_equality_key(needle);
     let items = query_summaries(
         connection,
-        &sql,
+        &prefix_sql(page, &pattern, key.is_some()),
         named_params! {
             ":pattern": pattern.value,
             ":key": key,
@@ -443,6 +376,119 @@ fn search_prefix_page(
         },
     )?;
     Ok(history_page(items, limit, page.reverse))
+}
+
+// The four statements below are the whole SQL surface of history reads, and
+// each one depends on an index staying reachable. They are built here rather
+// than inline so that the query plan test can EXPLAIN the exact string
+// production runs; a plan regression test that reads a copy of the SQL only
+// proves things about the copy.
+
+/// Keyset page over `idx_clips_recent`.
+fn recent_page_sql(page: PageSql) -> String {
+    format!(
+        "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
+                c.payload_size, substr(c.normalized_text, 1, 256),
+                EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
+         FROM clips AS c
+         WHERE {predicate}
+         ORDER BY c.last_used_at {order}, c.id {order}
+         LIMIT :limit",
+        predicate = page.predicate("c"),
+        order = page.order,
+    )
+}
+
+/// Filters the most recent 2000 rows, for needles too short to hit a trigram.
+fn recent_scan_sql(page: PageSql, pattern: &LikePattern) -> String {
+    format!(
+        "SELECT id, content_kind, last_used_at, pinned, copy_count,
+                payload_size, substr(normalized_text, 1, 256), has_image_preview
+         FROM (
+             SELECT id, content_kind, last_used_at, pinned, copy_count,
+                    payload_size, normalized_text,
+                    EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = clips.id)
+                        AS has_image_preview
+             FROM clips
+             WHERE normalized_text IS NOT NULL AND {predicate}
+             ORDER BY last_used_at {order}, id {order}
+             LIMIT 2000
+         )
+         WHERE {constraint}
+         ORDER BY last_used_at {order}, id {order}
+         LIMIT :limit",
+        predicate = page.predicate("clips"),
+        constraint = pattern.constraint("normalized_text"),
+        order = page.order,
+    )
+}
+
+/// Substring match handed to the fts5 trigram index.
+fn indexed_substring_sql(page: PageSql, pattern: &LikePattern) -> String {
+    format!(
+        "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
+                c.payload_size, substr(c.normalized_text, 1, 256),
+                EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
+         FROM clips_fts
+         JOIN clips AS c ON c.id = clips_fts.rowid
+         WHERE {constraint}
+           AND {predicate}
+         ORDER BY c.last_used_at {order}, c.id {order}
+         LIMIT :limit",
+        constraint = pattern.constraint("clips_fts.normalized_text"),
+        predicate = page.predicate("c"),
+        order = page.order,
+    )
+}
+
+/// Leading match seeking `idx_clips_text_prefix`.
+///
+/// `equality_key` selects the variant for needles that outrun the indexed
+/// prefix; pass what `prefix_equality_key` returned for the same needle.
+fn prefix_sql(page: PageSql, pattern: &LikePattern, equality_key: bool) -> String {
+    // rusqlite requires every named parameter to exist in both SQL variants.
+    // The NULL guard keeps `:key` present when the expression index uses LIKE.
+    // LIKE ignores collation entirely, so NOCASE is not what makes the match
+    // case-insensitive here; the case_sensitive_like pragma is. It is what lets
+    // both variants seek idx_clips_text_prefix, which is collated the same way.
+    // The equality variant does need it for correctness as well.
+    let indexed_prefix =
+        format!("substr(c.normalized_text, 1, {INDEXED_PREFIX_CHARS}) COLLATE NOCASE");
+    let prefix_clause = if equality_key {
+        format!("{indexed_prefix} = :key")
+    } else {
+        format!(
+            ":key IS NULL AND {constraint}",
+            constraint = pattern.constraint(&indexed_prefix),
+        )
+    };
+    format!(
+        "SELECT c.id, c.content_kind, c.last_used_at, c.pinned, c.copy_count,
+                c.payload_size, substr(c.normalized_text, 1, 256),
+                EXISTS(SELECT 1 FROM clip_previews p WHERE p.clip_id = c.id)
+         FROM clips AS c
+         WHERE {prefix_clause}
+           AND {constraint}
+           AND {predicate}
+         ORDER BY c.last_used_at {order}, c.id {order}
+         LIMIT :limit",
+        constraint = pattern.constraint("c.normalized_text"),
+        predicate = page.predicate("c"),
+        order = page.order,
+    )
+}
+
+/// How many leading characters `idx_clips_text_prefix` indexes.
+const INDEXED_PREFIX_CHARS: usize = 64;
+
+/// The `:key` binding for a prefix search, or `None` when a LIKE seek fits.
+///
+/// A needle longer than the indexed prefix can no longer be answered by a LIKE
+/// seek, so the query compares the indexed expression for equality against the
+/// leading characters instead and lets the unindexed `LIKE` filter the rest.
+fn prefix_equality_key(needle: &str) -> Option<String> {
+    (needle.chars().count() > INDEXED_PREFIX_CHARS)
+        .then(|| needle.chars().take(INDEXED_PREFIX_CHARS).collect())
 }
 
 #[derive(Clone, Copy)]
@@ -578,7 +624,11 @@ fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipSummary> {
     })
 }
 
-/// A `LIKE` operand together with the `ESCAPE` clause the operand needs.
+/// A `LIKE` comparison: the operand, plus the `ESCAPE` clause it needs.
+///
+/// Callers get the whole comparison from `constraint` rather than pasting the
+/// clause themselves, because forgetting to paste it is silent -- the query
+/// still returns rows, it just stops escaping them.
 ///
 /// The clause is only emitted when the needle actually carries a wildcard.
 /// fts5's trigram tokenizer refuses to take a `LIKE` over into the trigram
@@ -619,6 +669,11 @@ impl LikePattern {
             escape: if needs_escape { " ESCAPE '\\'" } else { "" },
         }
     }
+
+    /// The comparison against `column`, binding the operand to `:pattern`.
+    fn constraint(&self, column: &str) -> String {
+        format!("{column} LIKE :pattern{escape}", escape = self.escape)
+    }
 }
 
 #[cfg(test)]
@@ -626,44 +681,69 @@ mod tests {
     use super::*;
     use crate::{configure_connection, migrate};
 
+    // Every statement below is built by the function production calls, so
+    // editing the SQL moves the test with it. Handing EXPLAIN a hand-copied
+    // query instead would let the two drift: putting an unconditional
+    // `ESCAPE '\'` back into indexed_substring_sql is exactly the regression
+    // asserted against here, and a copy would keep passing right through it.
     #[test]
     fn production_search_sql_keeps_prefix_and_trigram_indexes() {
         let mut connection = Connection::open_in_memory().unwrap();
         configure_connection(&connection, 1024).unwrap();
         migrate(&mut connection).unwrap();
 
+        let older = PageSql::new(None, PageDirection::Older).unwrap();
+        let newer = PageSql::new(
+            Some(HistoryCursor {
+                last_used_at_ms: 1_000,
+                id: ClipId(500),
+            }),
+            PageDirection::Newer,
+        )
+        .unwrap();
+
+        let short_needle = "alpha";
+        let short_pattern = LikePattern::new(MatchMode::Prefix, short_needle);
+        let short_key = prefix_equality_key(short_needle);
+        assert!(short_key.is_none(), "a short needle takes the LIKE seek");
         let prefix_plan = explain(
             &connection,
-            "EXPLAIN QUERY PLAN
-             SELECT id FROM clips
-             WHERE substr(normalized_text, 1, 64) COLLATE NOCASE LIKE ?1 ESCAPE '\\'
-               AND normalized_text LIKE ?1 ESCAPE '\\'
-             ORDER BY last_used_at DESC, id DESC
-             LIMIT ?2",
-            params!["alpha%", 50_i64],
+            &prefix_sql(older, &short_pattern, short_key.is_some()),
+            named_params! {
+                ":pattern": short_pattern.value,
+                ":key": short_key,
+                ":anchor_time": older.anchor.last_used_at_ms,
+                ":anchor_id": older.anchor.id.0,
+                ":limit": 51_i64,
+            },
         );
         // A case-insensitive LIKE can only seek an index collated the same way,
         // so a plain SCAN here means the NOCASE collation drifted apart.
         assert!(
-            prefix_plan.contains("SEARCH clips USING INDEX idx_clips_text_prefix"),
+            prefix_plan.contains("SEARCH c USING INDEX idx_clips_text_prefix"),
             "prefix expression index missing: {prefix_plan}"
         );
 
-        // Needles longer than 64 characters compare the indexed prefix for
-        // equality instead. Dropping the collation there still returns the right
-        // rows, so only the plan can catch it falling back to a recency scan.
+        // Needles longer than the indexed prefix compare it for equality
+        // instead. Dropping the collation there still returns the right rows,
+        // so only the plan can catch it falling back to a recency scan.
+        let long_needle = "alpha".repeat(13);
+        let long_pattern = LikePattern::new(MatchMode::Prefix, &long_needle);
+        let long_key = prefix_equality_key(&long_needle);
+        assert!(long_key.is_some(), "a long needle takes the equality seek");
         let long_prefix_plan = explain(
             &connection,
-            "EXPLAIN QUERY PLAN
-             SELECT id FROM clips
-             WHERE substr(normalized_text, 1, 64) COLLATE NOCASE = ?1
-               AND normalized_text LIKE ?2 ESCAPE '\\'
-             ORDER BY last_used_at DESC, id DESC
-             LIMIT ?3",
-            params!["alpha".repeat(13), "alpha%", 50_i64],
+            &prefix_sql(older, &long_pattern, long_key.is_some()),
+            named_params! {
+                ":pattern": long_pattern.value,
+                ":key": long_key,
+                ":anchor_time": older.anchor.last_used_at_ms,
+                ":anchor_id": older.anchor.id.0,
+                ":limit": 51_i64,
+            },
         );
         assert!(
-            long_prefix_plan.contains("SEARCH clips USING INDEX idx_clips_text_prefix"),
+            long_prefix_plan.contains("SEARCH c USING INDEX idx_clips_text_prefix"),
             "prefix equality seek missing: {long_prefix_plan}"
         );
 
@@ -671,17 +751,16 @@ mod tests {
         // into the trigram index; a bare "VIRTUAL TABLE INDEX 0:" is the full
         // scan of the index content. An ESCAPE clause suppresses the takeover,
         // which is why LikePattern only emits one for needles that need it.
+        let substring_pattern = LikePattern::new(MatchMode::Substring, "alpha");
         let substring_plan = explain(
             &connection,
-            "EXPLAIN QUERY PLAN
-             SELECT c.id
-             FROM clips_fts
-             JOIN clips AS c ON c.id = clips_fts.rowid
-             WHERE clips_fts.normalized_text LIKE ?1
-               AND (c.last_used_at < ?2 OR (c.last_used_at = ?2 AND c.id < ?3))
-             ORDER BY c.last_used_at DESC, c.id DESC
-             LIMIT ?4",
-            params!["%alpha%", 1_000_i64, 500_i64, 51_i64],
+            &indexed_substring_sql(older, &substring_pattern),
+            named_params! {
+                ":pattern": substring_pattern.value,
+                ":anchor_time": older.anchor.last_used_at_ms,
+                ":anchor_id": older.anchor.id.0,
+                ":limit": 51_i64,
+            },
         );
         assert!(
             substring_plan.contains("VIRTUAL TABLE INDEX 0:L0"),
@@ -690,12 +769,12 @@ mod tests {
 
         let recent_page_plan = explain(
             &connection,
-            "EXPLAIN QUERY PLAN
-             SELECT id FROM clips
-             WHERE last_used_at < ?1 OR (last_used_at = ?1 AND id < ?2)
-             ORDER BY last_used_at DESC, id DESC
-             LIMIT ?3",
-            params![1_000_i64, 500_i64, 51_i64],
+            &recent_page_sql(older),
+            named_params! {
+                ":anchor_time": older.anchor.last_used_at_ms,
+                ":anchor_id": older.anchor.id.0,
+                ":limit": 51_i64,
+            },
         );
         assert!(
             recent_page_plan.contains("idx_clips_recent"),
@@ -704,16 +783,35 @@ mod tests {
 
         let newer_page_plan = explain(
             &connection,
-            "EXPLAIN QUERY PLAN
-             SELECT id FROM clips
-             WHERE last_used_at > ?1 OR (last_used_at = ?1 AND id > ?2)
-             ORDER BY last_used_at ASC, id ASC
-             LIMIT ?3",
-            params![1_000_i64, 500_i64, 51_i64],
+            &recent_page_sql(newer),
+            named_params! {
+                ":anchor_time": newer.anchor.last_used_at_ms,
+                ":anchor_id": newer.anchor.id.0,
+                ":limit": 51_i64,
+            },
         );
         assert!(
             newer_page_plan.contains("idx_clips_recent"),
             "newer keyset index missing: {newer_page_plan}"
+        );
+
+        // The bounded scan is only bounded because its inner query walks the
+        // recency index and stops at 2000 rows. Losing the index there turns
+        // every one- or two-character needle into a full table scan.
+        let scan_pattern = LikePattern::new(MatchMode::Substring, "al");
+        let recent_scan_plan = explain(
+            &connection,
+            &recent_scan_sql(older, &scan_pattern),
+            named_params! {
+                ":pattern": scan_pattern.value,
+                ":anchor_time": older.anchor.last_used_at_ms,
+                ":anchor_id": older.anchor.id.0,
+                ":limit": 51_i64,
+            },
+        );
+        assert!(
+            recent_scan_plan.contains("idx_clips_recent"),
+            "bounded scan lost its recency index: {recent_scan_plan}"
         );
     }
 
@@ -722,13 +820,19 @@ mod tests {
         // No wildcard: no ESCAPE, so the fts5 trigram takeover stays available.
         let plain = LikePattern::new(MatchMode::Substring, "alpha");
         assert_eq!(plain.value, "%alpha%");
-        assert_eq!(plain.escape, "");
+        assert_eq!(
+            plain.constraint("clips_fts.normalized_text"),
+            "clips_fts.normalized_text LIKE :pattern"
+        );
 
         // A wildcard still has to be escaped for correctness. Losing the
         // takeover for these needles is the deliberate trade.
         let percent = LikePattern::new(MatchMode::Substring, "100%");
         assert_eq!(percent.value, "%100\\%%");
-        assert_eq!(percent.escape, " ESCAPE '\\'");
+        assert_eq!(
+            percent.constraint("clips_fts.normalized_text"),
+            "clips_fts.normalized_text LIKE :pattern ESCAPE '\\'"
+        );
 
         let underscore = LikePattern::new(MatchMode::Prefix, "a_b");
         assert_eq!(underscore.value, "a\\_b%");
@@ -740,7 +844,9 @@ mod tests {
     }
 
     fn explain<P: rusqlite::Params>(connection: &Connection, sql: &str, parameters: P) -> String {
-        let mut statement = connection.prepare(sql).unwrap();
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
         statement
             .query_map(parameters, |row| row.get::<_, String>(3))
             .unwrap()
