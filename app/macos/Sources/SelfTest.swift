@@ -678,9 +678,170 @@ private func layoutStatusRow() -> Int32 {
     return 0
 }
 
+/// A real pasteboard that another process gets to just as the restore's write
+/// lands. Stands in for the window between the write and the restore returning,
+/// which is too small to hit on purpose from the outside.
+private final class InterruptedPasteboard: PasteboardWriteTarget {
+    private let pasteboard: NSPasteboard
+    private let interrupt: () -> Void
+
+    init(pasteboard: NSPasteboard, interrupt: @escaping () -> Void) {
+        self.pasteboard = pasteboard
+        self.interrupt = interrupt
+    }
+
+    func clearContents() -> Int { pasteboard.clearContents() }
+
+    func writeObjects(_ objects: [any NSPasteboardWriting]) -> Bool {
+        let wrote = pasteboard.writeObjects(objects)
+        interrupt()
+        return wrote
+    }
+}
+
+/// A pasteboard whose clear moves the count but whose write does not take.
+/// `NSPasteboard` gives no way to provoke that, and the count it leaves behind
+/// belongs to no clip of ours.
+private final class FailingPasteboard: PasteboardWriteTarget {
+    private let pasteboard: NSPasteboard
+
+    init(pasteboard: NSPasteboard) {
+        self.pasteboard = pasteboard
+    }
+
+    func clearContents() -> Int { pasteboard.clearContents() }
+
+    func writeObjects(_: [any NSPasteboardWriting]) -> Bool { false }
+}
+
+/// Covers the boundary between restoring a clip and capturing one: the write a
+/// restore makes must not come back as a copy, and nothing else may be lost in
+/// the process of arranging that.
+func runSelfCaptureSelfTest() -> Int32 {
+    let pasteboard = NSPasteboard(name: .init("clipboard-history-self-test-\(UUID().uuidString)"))
+    var captured: [String] = []
+    let monitor = PasteboardMonitor(
+        pasteboard: pasteboard,
+        onCapture: { candidate in
+            let text = candidate.representations
+                .first { $0.uti == "public.utf8-plain-text" }
+                .flatMap { String(data: $0.bytes, encoding: .utf8) }
+            captured.append(text ?? "<no text>")
+        },
+        onRejection: { _ in }
+    )
+
+    func copyExternally(_ text: String) {
+        let item = NSPasteboardItem()
+        item.setData(Data(text.utf8), forType: .string)
+        pasteboard.clearContents()
+        pasteboard.writeObjects([item])
+    }
+
+    copyExternally("one")
+    monitor.poll()
+    guard captured == ["one"] else {
+        fputs("a copy made outside the app was not captured: \(captured)\n", stderr)
+        return 1
+    }
+
+    // Restoring writes the same bytes back. Left unacknowledged this is what the
+    // monitor reads as a second copy of "one".
+    let restored = [RepresentationDto(uti: "public.utf8-plain-text", bytes: Data("one".utf8))]
+    do {
+        let changeCount = try PasteboardWriter.restore(
+            representations: restored,
+            pasteboard: pasteboard
+        )
+        monitor.acknowledgeSelfWrite(changeCount: changeCount)
+    } catch {
+        fputs("restoring onto the self-test pasteboard failed: \(error)\n", stderr)
+        return 1
+    }
+    monitor.poll()
+    guard captured == ["one"] else {
+        fputs("the app's own restore was captured as a new copy: \(captured)\n", stderr)
+        return 1
+    }
+
+    // Suppression is spent on that one write, not on the clip: copying the same
+    // text again by hand is a real recopy and still has to reach the store.
+    copyExternally("one")
+    monitor.poll()
+    guard captured == ["one", "one"] else {
+        fputs("a genuine recopy after a restore was swallowed: \(captured)\n", stderr)
+        return 1
+    }
+
+    // A copy that lands between the restore and the poll moves the pasteboard
+    // past the acknowledged count, so it must not be suppressed either.
+    do {
+        let changeCount = try PasteboardWriter.restore(
+            representations: restored,
+            pasteboard: pasteboard
+        )
+        monitor.acknowledgeSelfWrite(changeCount: changeCount)
+    } catch {
+        fputs("restoring onto the self-test pasteboard failed: \(error)\n", stderr)
+        return 1
+    }
+    copyExternally("two")
+    monitor.poll()
+    guard captured == ["one", "one", "two"] else {
+        fputs("a copy racing the restore was lost: \(captured)\n", stderr)
+        return 1
+    }
+
+    // The same race one step earlier: the outside copy lands while the restore is
+    // still returning. The count that comes back has to be the one the restore's
+    // own write went to, not whatever the pasteboard holds by the time it returns,
+    // or acknowledging it makes the monitor skip the copy that overtook it.
+    do {
+        let changeCount = try PasteboardWriter.restore(
+            representations: restored,
+            pasteboard: InterruptedPasteboard(pasteboard: pasteboard) { copyExternally("three") }
+        )
+        monitor.acknowledgeSelfWrite(changeCount: changeCount)
+    } catch {
+        fputs("restoring onto the self-test pasteboard failed: \(error)\n", stderr)
+        return 1
+    }
+    monitor.poll()
+    guard captured == ["one", "one", "two", "three"] else {
+        fputs("a copy that overtook the restore was skipped: \(captured)\n", stderr)
+        return 1
+    }
+
+    // A write that does not take leaves a count behind that belongs to nothing.
+    // Restoring has to fail rather than hand it over to be acknowledged.
+    do {
+        let changeCount = try PasteboardWriter.restore(
+            representations: restored,
+            pasteboard: FailingPasteboard(pasteboard: pasteboard)
+        )
+        monitor.acknowledgeSelfWrite(changeCount: changeCount)
+        fputs("a failed write was reported as a restore at \(changeCount)\n", stderr)
+        return 1
+    } catch PasteboardRestoreError.writeFailed {
+        // Expected.
+    } catch {
+        fputs("a failed write raised the wrong error: \(error)\n", stderr)
+        return 1
+    }
+    copyExternally("four")
+    monitor.poll()
+    guard captured == ["one", "one", "two", "three", "four"] else {
+        fputs("a copy after a failed restore was lost: \(captured)\n", stderr)
+        return 1
+    }
+
+    return 0
+}
+
 func runSelfTest() -> Int32 {
     let stages: [(String, () -> Int32)] = [
         ("bindings", runBindingSelfTest),
+        ("self capture", runSelfCaptureSelfTest),
         ("history feed", runHistoryFeedSelfTest),
         ("status row", runStatusRowSelfTest),
     ]

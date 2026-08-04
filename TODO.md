@@ -8,9 +8,9 @@
 
 ### 自己再captureの抑止
 
-- [ ] 履歴復元によるPasteboard更新をmonitorが再保存しない仕組みを決める
-- [ ] change countまたはcanonical identityで次の1回だけ抑止する
-- [ ] 通常の再copyは従来どおり`recopy = touch`になることをテストする
+- [x] 履歴復元によるPasteboard更新をmonitorが再保存しない仕組みを決める
+- [x] change countまたはcanonical identityで次の1回だけ抑止する
+- [x] 通常の再copyは従来どおり`recopy = touch`になることをテストする
 
 完了条件: 履歴を復元しても`copy_count`と並び順が意図せず変化しない。
 
